@@ -1,0 +1,15 @@
+{
+    "pluginmetadataversion": 2,
+    "name": "Script Bridge",
+    "type": ["helper"],
+    "api": ["python3"],
+    "description": "Run token-authenticated Python scripts in the running app from a local client (bnrun).",
+    "longdescription": "See README.md.",
+    "license": {"name": "MIT", "text": "Copyright (c) 2026 Patrick Rosendahl"},
+    "platforms": ["Darwin"],
+    "installinstructions": {"Darwin": "Symlink this directory into the Binary Ninja user plugins directory and restart."},
+    "dependencies": {},
+    "version": "0.1.0",
+    "author": "Patrick Rosendahl",
+    "minimumbinaryninjaversion": 3000
+}

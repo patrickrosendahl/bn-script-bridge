@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Claude Code headersHelper for the lock-aware Binary Ninja MCP proxy (see README.md).
+
+Prints the calling session's identity as headers, so a session's MCP calls and its bnrun
+scripts count as the same lock holder:
+
+    X-BN-Session       the Claude Code session id
+    X-BN-Session-Name  $BN_SESSION_NAME, else the session's name (from the sessions file)
+
+Source: $CLAUDE_CODE_SESSION_ID if Claude Code passes it to the helper; otherwise the helper
+walks up its parent processes to the Claude Code process and reads
+~/.claude/sessions/<pid>.json (an undocumented Claude Code file with sessionId and name).
+Without either it prints {} and the proxy falls back to the MCP connection's id. Each run
+appends one line to ~/.cache/bn-mcp-session-header.log (which source was used).
+"""
+
+import json
+import os
+import subprocess
+import time
+
+
+def parent_pid(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=2).stdout.strip()
+        return int(out) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def session_from_ancestors():
+    sessions = os.path.join(os.path.expanduser("~"), ".claude", "sessions")
+    pid = os.getppid()
+    for _ in range(8):
+        if not pid or pid <= 1:
+            break
+        try:
+            with open(os.path.join(sessions, "%d.json" % pid)) as f:
+                info = json.load(f)
+            if info.get("sessionId"):
+                return info["sessionId"], info.get("name") or "", "sessions/%d.json" % pid
+        except (OSError, ValueError):
+            pass
+        pid = parent_pid(pid)
+    return None, "", "none"
+
+
+def main():
+    found, found_name, source = session_from_ancestors()
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        source = "env"
+        if found != session:        # the sessions file belongs to someone else: not its name
+            found_name = ""
+    else:
+        session = found
+    name = os.environ.get("BN_SESSION_NAME") or found_name
+    headers = {}
+    if session:
+        headers["X-BN-Session"] = session
+    if name:
+        headers["X-BN-Session-Name"] = name
+    print(json.dumps(headers))
+    try:
+        log = os.path.expanduser("~/.cache/bn-mcp-session-header.log")
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a") as f:
+            f.write("%s pid=%d ppid=%d source=%s session=%s name=%s\n" % (
+                time.strftime("%Y-%m-%dT%H:%M:%S"), os.getpid(), os.getppid(), source,
+                session, name))
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
