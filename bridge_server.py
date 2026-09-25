@@ -481,6 +481,8 @@ class McpProxy:
                 try:
                     if add_tools and resp.status == 200:
                         return self._forward_tools_list(resp)
+                    if resp.status == 400 and self.headers.get("Mcp-Session-Id"):
+                        return self._forward_bad_request(resp)
                     self.send_response(resp.status, resp.reason)
                     for k, v in resp.getheaders():
                         if k.lower() not in _HOP_HEADERS:
@@ -523,6 +525,25 @@ class McpProxy:
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Connection", "close")
                 self.close_connection = True
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _forward_bad_request(self, resp) -> None:
+                """Relay a 400, but turn "unknown session" into 404.
+
+                Binary Ninja answers a stale MCP-Session-Id (e.g. after its MCP server was
+                restarted, which the plugin does on every bridge start) with 400 "Missing or
+                invalid MCP-Session-Id". The MCP spec says 404, which makes clients
+                re-initialize on their own; with 400 they stay broken until reconnected."""
+                data = resp.read()
+                if b"MCP-Session-Id" in data:
+                    return _reply_json(self, 404, {"error": "unknown MCP session (Binary Ninja's "
+                                                            "MCP server restarted); re-initialize"})
+                self.send_response(resp.status, resp.reason)
+                for k, v in resp.getheaders():
+                    if k.lower() not in _HOP_HEADERS:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
 

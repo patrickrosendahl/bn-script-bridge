@@ -278,6 +278,14 @@ class FakeMcpUpstream:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.headers.get("Mcp-Session-Id") in ("stale", "stale-other"):
+                    msg = (b"Missing or invalid MCP-Session-Id" if
+                           self.headers["Mcp-Session-Id"] == "stale" else b"bad params")
+                    self.send_response(400)
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    self.wfile.write(msg)
+                    return
                 upstream.requests.append((dict(self.headers), body))
                 if body.get("method") == "tools/list":
                     result = {"tools": [{"name": "bn_function_list", "inputSchema": {}}]}
@@ -389,6 +397,13 @@ class McpProxyTest(unittest.TestCase):
         r = self.call_tool("bn_owner_set", {}, session="sess-fe",
                            headers={"X-BN-Session-Name": "buschjaeger-fe"})
         self.assertEqual(r["structuredContent"]["lock"]["name"], "buschjaeger-fe")
+
+    def test_stale_session_becomes_404_other_400s_pass(self):
+        resp, text = self.rpc("tools/list", mcp_session="stale")
+        self.assertEqual(resp.status, 404)
+        self.assertIn("re-initialize", text)
+        resp, text = self.rpc("tools/list", mcp_session="stale-other")
+        self.assertEqual((resp.status, text), (400, "bad params"))
 
     def test_rejects_browser_requests_and_reports_dead_upstream(self):
         resp, _ = self.rpc("tools/list", headers={"Origin": "http://evil.example"})
