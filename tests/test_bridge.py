@@ -4,10 +4,13 @@ import http.client
 import http.server
 import json
 import os
+import random
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +39,9 @@ def namespace(view_filter):
     return {"bv": VIEWS[0], "bvs": VIEWS}
 
 
-class BridgeTest(unittest.TestCase):
+class BridgeFixture(unittest.TestCase):
+    """A running ScriptBridge with a fake namespace and a bnrun config pointing at it."""
+
     def setUp(self):
         self.token = bridge_server.new_token()
         self.main_calls = []
@@ -73,6 +78,8 @@ class BridgeTest(unittest.TestCase):
         return subprocess.run([sys.executable, BNRUN, *args], input=stdin, capture_output=True,
                               text=True, env=env, timeout=30)
 
+
+class BridgeTest(BridgeFixture):
     def test_ping(self):
         self.assertEqual(self.request("GET", "/ping"), (200, {"ok": True}))
 
@@ -231,7 +238,7 @@ class LockEndpointTest(BridgeTest):
     def test_bnrun_lock_commands(self):
         me = ("--session", "sess-fe", "--name", "fe")
         r = self.bnrun("--status")
-        self.assertEqual((r.returncode, r.stdout), (0, "free\n"))
+        self.assertEqual((r.returncode, r.stdout), (0, "free\nno script running\n"))
         r = self.bnrun("--lock", "--purpose", "ctl.bin", "--ttl", "2", *me)
         self.assertEqual(r.returncode, 0)
         self.assertIn("locked by fe: ctl.bin", r.stdout)
@@ -263,6 +270,199 @@ class LockEndpointTest(BridgeTest):
         self.assertEqual(r.returncode, 0)
         self.assertIn("locked by envname", r.stdout)
         self.assertEqual(self.bridge.lock.status()["session"], "sess-env")
+
+
+BUSY = "print('started')\nwhile True:\n    try:\n        pass\n    except Exception:\n        pass\n"
+
+
+class CancelTest(BridgeFixture):
+    def run_async(self, body):
+        """POST /run on a thread; returns (thread, box) with box["reply"] when it answers."""
+        box = {}
+        t = threading.Thread(target=lambda: box.update(
+            reply=self.request("POST", "/run", body)), daemon=True)
+        t.start()
+        return t, box
+
+    def wait_running(self):
+        for _ in range(500):
+            running = self.request("GET", "/run")[1]["running"]
+            if running and running["state"] == "running":
+                return running
+            time.sleep(0.01)
+        self.fail("script never started")
+
+    def assert_idle_and_usable(self):
+        self.assertFalse(self.bridge.run_mutex.locked())
+        self.assertEqual(self.request("GET", "/run")[1], {"ok": True, "running": None,
+                                                          "queued": 0})
+        status, reply = self.request("POST", "/run", {"code": "result = sum(range(100000))"})
+        self.assertEqual((status, reply["ok"], reply["result"]), (200, True, 4999950000))
+
+    def test_cancel_busy_loop(self):
+        t, box = self.run_async({"code": BUSY, "session": "sess-fe", "name": "fe"})
+        running = self.wait_running()
+        self.assertEqual((running["label"], running["session"], running["name"]),
+                         ("print('started')", "sess-fe", "fe"))
+        self.assertIn("running script \"print('started')\" for 0s (fe)",
+                      bridge_server.describe_run(running))
+        self.assertEqual(self.request("GET", "/lock")[1]["running"]["label"], "print('started')")
+        status, reply = self.request("POST", "/cancel", {"session": "sess-fe"})
+        self.assertEqual((status, reply["cancelled"]["cancel_requested"]),
+                         (200, "session sess-fe"))
+        t.join(10)
+        self.assertFalse(t.is_alive())
+        status, reply = box["reply"]
+        self.assertEqual(status, 200)
+        self.assertEqual((reply["ok"], reply["error"], reply["stdout"], reply["cancelled_by"]),
+                         (False, "cancelled", "started\n", "session sess-fe"))
+        self.assert_idle_and_usable()
+
+    def test_timeout(self):
+        start = time.time()
+        status, reply = self.request("POST", "/run", {"code": BUSY, "timeout": 0.3})
+        self.assertLess(time.time() - start, 5)
+        self.assertEqual((status, reply["error"], reply["cancelled_by"], reply["stdout"]),
+                         (200, "cancelled", "timeout after 0.3s", "started\n"))
+        _, reply = self.request("POST", "/run", {"code": "result = 1", "timeout": 5})
+        self.assertEqual(reply["result"], 1)
+        for bad in (0, -1, "soon", True):
+            self.assertEqual(self.request("POST", "/run", {"code": "pass", "timeout": bad})[0],
+                             400, bad)
+        self.assert_idle_and_usable()
+
+    def test_cancel_when_idle(self):
+        status, reply = self.request("POST", "/cancel", {"session": "sess-fe", "force": True})
+        self.assertEqual((status, reply["error"]), (409, "no script is running"))
+        self.assert_idle_and_usable()
+
+    def test_permissions(self):
+        t, box = self.run_async({"code": BUSY, "session": "sess-fe"})
+        self.wait_running()
+        for body in ({}, {"session": "sess-audio"}, {"run_id": None, "session": "sess-x"}):
+            status, reply = self.request("POST", "/cancel", body)
+            self.assertEqual(status, 403, body)
+            self.assertIn("not allowed", reply["error"])
+        self.assertTrue(t.is_alive())
+        status, reply = self.request("POST", "/cancel", {"session": "sess-audio", "force": True})
+        self.assertEqual((status, reply["cancelled"]["cancel_requested"]),
+                         (200, "force by sess-audio"))
+        t.join(10)
+        self.assertEqual(box["reply"][1]["error"], "cancelled")
+        self.assert_idle_and_usable()
+
+    def test_lock_holder_may_cancel(self):
+        t, box = self.run_async({"code": BUSY})                # no session
+        self.wait_running()
+        self.request("POST", "/lock", {"session": "sess-fe"})
+        self.assertEqual(self.request("POST", "/cancel", {"session": "sess-fe"})[0], 200)
+        t.join(10)
+        self.assertEqual(box["reply"][1]["cancelled_by"], "lock holder sess-fe")
+        self.request("POST", "/unlock", {"session": "sess-fe"})
+        self.assert_idle_and_usable()
+
+    def test_run_id_cancels_running_or_queued_run(self):
+        t, box = self.run_async({"code": BUSY, "run_id": "r1"})
+        self.wait_running()
+        t2, box2 = self.run_async({"code": "result = 'queued ran'", "run_id": "r2"})
+        for _ in range(500):
+            if self.request("GET", "/run")[1]["queued"] == 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.request("POST", "/cancel", {"run_id": "r2"})[1],
+                         {"ok": True, "cancelled": None, "pending": True})
+        self.assertEqual(self.request("POST", "/cancel", {"run_id": "r1"})[0], 200)
+        t.join(10)
+        t2.join(10)
+        self.assertEqual(box["reply"][1]["cancelled_by"], "its client")
+        self.assertEqual((box2["reply"][1]["error"], box2["reply"][1]["stdout"]),
+                         ("cancelled", ""))
+        self.assert_idle_and_usable()
+
+    def test_main_thread_runner_targets_executing_thread(self):
+        jobs = []
+        executed_on = []
+        stop = threading.Event()
+
+        def main_loop():                        # stands in for Binary Ninja's UI thread
+            while not stop.is_set():
+                if jobs:
+                    fn, done = jobs.pop()
+                    executed_on.append(threading.get_ident())
+                    fn()
+                    done.set()
+                time.sleep(0.005)
+            executed_on.append("survived")
+
+        main = threading.Thread(target=main_loop, daemon=True)
+        main.start()
+
+        def runner(fn):
+            done = threading.Event()
+            jobs.append((fn, done))
+            done.wait()
+        self.bridge.main_thread_runner = runner
+        t, box = self.run_async({"code": BUSY, "main_thread": True, "session": "s"})
+        self.wait_running()
+        self.assertEqual(self.request("POST", "/cancel", {"session": "s"})[0], 200)
+        t.join(10)
+        self.assertEqual(box["reply"][1]["error"], "cancelled")
+        _, reply = self.request("POST", "/run", {"code": "result = 2", "main_thread": True})
+        self.assertEqual(reply["result"], 2)
+        self.assertEqual(executed_on, [main.ident, main.ident])
+        stop.set()
+        main.join(5)
+        self.assertEqual(executed_on[-1], "survived")   # no stray ScriptCancelled killed it
+
+    def test_cancel_racing_script_end_never_leaks(self):
+        rnd = random.Random(1)
+        for i in range(30):
+            t, box = self.run_async({"code": "for i in range(%d): pass\nresult = 'done'"
+                                     % rnd.randrange(1, 200000), "session": "s"})
+            time.sleep(rnd.random() * 0.01)
+            self.request("POST", "/cancel", {"session": "s"})
+            t.join(10)
+            reply = box["reply"][1]
+            self.assertTrue(reply["result"] == "done" or reply["error"] == "cancelled", reply)
+        self.assert_idle_and_usable()
+
+    def test_bnrun_cancel_timeout_and_status(self):
+        r = self.bnrun("--cancel", "--session", "s")
+        self.assertEqual((r.returncode, r.stderr), (1, "bnrun: no script is running\n"))
+        r = self.bnrun("--timeout", "0.3", stdin=BUSY)
+        self.assertEqual((r.returncode, r.stdout), (1, "started\n"))
+        self.assertIn("script cancelled (by timeout after 0.3s)", r.stderr)
+        t, box = self.run_async({"code": BUSY, "session": "sess-fe", "name": "fe"})
+        self.wait_running()
+        r = self.bnrun("--status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("running script \"print('started')\"", r.stdout)
+        r = self.bnrun("--cancel", "--session", "sess-audio")
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("not allowed", r.stderr)
+        r = self.bnrun("--cancel", "--force", "--session", "sess-audio")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("cancel sent", r.stdout)
+        t.join(10)
+        self.assertEqual(box["reply"][1]["error"], "cancelled")
+        self.assert_idle_and_usable()
+
+    def test_bnrun_ctrl_c_cancels(self):
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config)
+        env.pop("CLAUDE_CODE_SESSION_ID", None)            # cancel must work without a session
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            proc = subprocess.Popen([sys.executable, BNRUN, "-e", BUSY], env=env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.wait_running()
+            proc.send_signal(sig)
+            _, err = proc.communicate(timeout=20)
+            self.assertEqual(proc.returncode, 130, err)
+            self.assertIn("script cancelled in Binary Ninja", err)
+            for _ in range(500):
+                if self.request("GET", "/run")[1]["running"] is None:
+                    break
+                time.sleep(0.01)
+            self.assert_idle_and_usable()
 
 
 class FakeMcpUpstream:

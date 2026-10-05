@@ -37,9 +37,40 @@ The script sees:
 
 `print()` output is returned, and so is `result` if the script sets it (JSON, else `repr`).
 Scripts run one at a time on a worker thread; `--main-thread` runs on the UI thread (needed
-for UI objects; it blocks the UI while it runs). A script can't be interrupted from outside, so
-avoid endless loops. Exit status: 0 ok, 1 script error, 2 bridge unreachable or refused,
-3 Binary Ninja locked by someone else (see below).
+for UI objects; it blocks the UI while it runs); later scripts queue behind the running one.
+Exit status: 0 ok, 1 script error or cancelled, 2 bridge unreachable or refused, 3 Binary Ninja
+locked by someone else (see below), 130 interrupted with Ctrl-C.
+
+## Cancelling scripts
+
+```sh
+bnrun --status                    # lock, plus "running script '<first line>' for 42s (session ...)"
+bnrun --timeout 60 script.py      # the bridge cancels the script after 60 s of running
+bnrun --cancel                    # cancel the running script (this session's, or as lock holder)
+bnrun --cancel --force            # cancel another session's script
+```
+
+- **Ctrl-C** (or SIGTERM, e.g. a tool timeout killing `bnrun`) while `bnrun` waits cancels that
+  script inside Binary Ninja too, then exits with 130. Each run carries a random run id, so this
+  works without a session id and only ever hits its own script (also while still queued).
+- `--cancel` is allowed for the session that started the script (`--session`) or the usage-lock
+  holder; `--force` for anyone. Nothing running: exit 1 ("no script is running"); not allowed:
+  exit 3.
+- A cancelled script's reply has `"error": "cancelled"`, `"cancelled_by"` (session, lock holder,
+  force, its client, or `timeout after Ns`) and the `print()` output captured so far.
+- How: the bridge raises `ScriptCancelled` (a `BaseException`, so a script's `except Exception`
+  doesn't swallow it) in the thread running the script, with `PyThreadState_SetAsyncExc`; with
+  `--main-thread` that is Binary Ninja's UI thread. A cancel that would land after the script
+  finished is cleared, so it never reaches other code on that thread.
+- **Limitation:** Python delivers it only between bytecodes. A script blocked in a long native
+  call (`bv.update_analysis_and_wait()`, `time.sleep()`, one big API call) stops only when that
+  call returns. Write long jobs as bounded loops over small steps (and print progress), not as one
+  huge native call. A script that catches `BaseException` and carries on can't be cancelled.
+  Whatever the script changed before the cancel stays changed (no rollback).
+
+Endpoints: `GET /run` (running script and queue length; `GET /lock` includes it too) and
+`POST /cancel {"session", "run_id", "force"}`; `POST /run` takes `"timeout"` (seconds) and
+`"run_id"`. Cancellation needs this plugin version loaded: restart Binary Ninja after updating.
 
 ## Usage lock (coordinating sessions)
 
@@ -116,7 +147,8 @@ token file, as they could read your files anyway.
 
 ## Tests
 
-`python3 -m unittest discover -s tests -p 'test_*.py'` runs `tests/test_bridge.py` against `bridge_server.py` (bridge, lock, MCP proxy against a fake upstream), `bnrun` and
+`python3 -m unittest discover -s tests -p 'test_*.py'` runs `tests/test_bridge.py` against `bridge_server.py` (bridge, lock, cancellation and timeouts including a fake main-thread
+runner, MCP proxy against a fake upstream), `bnrun` (including Ctrl-C/SIGTERM) and
 `mcp-session-header` with a fake namespace and a fake home directory. The plugin glue
 (`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's
 MCP server) only runs inside Binary Ninja and is not covered.

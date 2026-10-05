@@ -7,9 +7,16 @@ MCP proxy, so it can be tested with a plain python3.
 Script bridge endpoints (bearer token + localhost checks, see ScriptBridge):
 
     GET  /ping     {"ok": true}
-    POST /run      {"code": str, "view": str?, "main_thread": bool?, "session": str?}
-                   -> {"ok", "stdout", "result", "error"}; 423 while locked by another session
-    GET  /lock     lock status
+    POST /run      {"code": str, "view": str?, "main_thread": bool?, "session": str?,
+                    "timeout": seconds?, "run_id": str?}
+                   -> {"ok", "stdout", "result", "error"}; 423 while locked by another session.
+                   A cancelled script answers error "cancelled" (plus "cancelled_by") with the
+                   stdout captured so far.
+    GET  /run      {"ok", "running": script status or null, "queued": int}
+    POST /cancel   {"session": str?, "run_id": str?, "force": bool?} cancel the running script
+                   (or, with run_id, that run even if still queued); 409 if nothing to cancel,
+                   403 if not allowed (see ScriptBridge.cancel)
+    GET  /lock     lock status (+ "running", as GET /run)
     POST /lock     {"session": str, "name": str?, "purpose": str?, "ttl": seconds?}
                    take the lock, or renew it if this session already holds it
     POST /unlock   {"session": str?, "force": bool?} release it
@@ -33,8 +40,16 @@ bypasses the lock. The proxy makes the lock visible to MCP clients:
 The caller's identity is the X-BN-Session header if the client sends one (Claude Code:
 headersHelper printing CLAUDE_CODE_SESSION_ID, so it matches bnrun's identity), else the
 MCP-Session-Id that Binary Ninja's server assigned to that connection.
+
+Cancellation: a cancel raises ScriptCancelled (a BaseException, so `except Exception` in a
+script doesn't swallow it) in the thread executing the script, through
+PyThreadState_SetAsyncExc. Python delivers it between bytecodes only: a script blocked in a long
+native call (bv.update_analysis_and_wait(), time.sleep(), a big C++ API call) stops when that
+call returns. The bridge clears a cancel that would land after the script finished, so it never
+leaks into whatever the thread (e.g. Binary Ninja's main thread) runs next.
 """
 
+import ctypes
 import hmac
 import http.client
 import http.server
@@ -72,9 +87,49 @@ def _jsonable(value: Any) -> Any:
         return repr(value)
 
 
-def run_script(code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
-    """Execute code with print() captured; the script may set `result`."""
-    out = io.StringIO()
+class ScriptCancelled(BaseException):
+    """Raised inside a running script to cancel it (BaseException: `except Exception` misses it)."""
+
+
+_set_async_exc_fn = None
+
+
+def _async_exc_function():
+    """PyThreadState_SetAsyncExc from the running interpreter (cached)."""
+    global _set_async_exc_fn
+    if _set_async_exc_fn is None:
+        candidates = [lambda: ctypes.pythonapi]
+        # Embedded interpreters (Binary Ninja) may load libpython without exporting its symbols
+        # globally; then look in the library itself.
+        import os
+        import sys
+        import sysconfig
+        for path in (os.path.join(sys.base_prefix, "Python"),
+                     os.path.join(sysconfig.get_config_var("LIBDIR") or "",
+                                  sysconfig.get_config_var("LDLIBRARY") or "")):
+            candidates.append(lambda path=path: ctypes.PyDLL(path))
+        for candidate in candidates:
+            try:
+                _set_async_exc_fn = candidate().PyThreadState_SetAsyncExc
+                break
+            except (OSError, AttributeError):
+                continue
+        else:
+            raise RuntimeError("PyThreadState_SetAsyncExc not found; can't cancel scripts")
+    return _set_async_exc_fn
+
+
+def set_async_exc(ident: int, exc: Optional[type]) -> int:
+    """Raise exc in thread `ident` at its next bytecode; exc=None clears a pending one.
+    Returns the number of threads affected (0: no such thread)."""
+    return _async_exc_function()(ctypes.c_ulong(ident),
+                                 ctypes.py_object(exc) if exc is not None else None)
+
+
+def run_script(code: str, namespace: Dict[str, Any],
+               out: Optional[io.StringIO] = None) -> Dict[str, Any]:
+    """Execute code with print() captured into `out`; the script may set `result`."""
+    out = out if out is not None else io.StringIO()
 
     def captured_print(*args, **kwargs):
         kwargs.setdefault("file", out)
@@ -87,6 +142,8 @@ def run_script(code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
         exec(compile(code, "<bridge>", "exec"), namespace)
         return {"ok": True, "stdout": out.getvalue(),
                 "result": _jsonable(namespace.get("result")), "error": None}
+    except ScriptCancelled:
+        return {"ok": False, "stdout": out.getvalue(), "result": None, "error": "cancelled"}
     except BaseException:  # noqa: BLE001 -- report everything, including SystemExit
         return {"ok": False, "stdout": out.getvalue(), "result": None,
                 "error": traceback.format_exc()}
@@ -188,6 +245,64 @@ def describe(status: Dict[str, Any]) -> str:
         status["held_for"], status["expires_in"], status["session"])
 
 
+def _label(code: str) -> str:
+    """First meaningful line of a script, for status displays."""
+    for line in code.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line if len(line) <= 60 else line[:57] + "..."
+    return "<empty>"
+
+
+class Run:
+    """One /run request: its identity and the cancellation handshake with the executing thread.
+
+    executing/sending/exc_sent are plain attributes; each assignment is atomic under the GIL.
+    The canceller (holding ScriptBridge.state) sets sending, re-checks executing and only then
+    raises; the executing thread clears executing, waits while sending, and clears any exception
+    that was sent (see ScriptBridge._run_guarded)."""
+
+    def __init__(self, code: str, session: Optional[str], name: str, main_thread: bool,
+                 timeout: Optional[float], run_id: str):
+        self.run_id = run_id
+        self.session = session
+        self.name = name
+        self.label = _label(code)
+        self.main_thread = main_thread
+        self.timeout = timeout
+        self.queued_at = time.time()
+        self.started: Optional[float] = None
+        self.thread: Optional[int] = None
+        self.executing = False
+        self.sending = False
+        self.exc_sent = False
+        self.cancel_by: Optional[str] = None
+        self.timer: Optional[threading.Timer] = None
+
+    def status(self) -> Dict[str, Any]:
+        now = time.time()
+        return {"session": self.session, "name": self.name, "label": self.label,
+                "main_thread": self.main_thread, "timeout": self.timeout,
+                "state": "running" if self.started else "starting",
+                "running_for": int(now - self.started) if self.started else 0,
+                "cancel_requested": self.cancel_by}
+
+
+def describe_run(status: Optional[Dict[str, Any]]) -> str:
+    if not status:
+        return "no script running"
+    who = status.get("name") or (status.get("session") or "")[:8] or "no session"
+    extra = [who]
+    if status.get("main_thread"):
+        extra.append("main thread")
+    if status.get("timeout"):
+        extra.append("timeout %gs" % status["timeout"])
+    if status.get("cancel_requested"):
+        extra.append("cancel requested: %s" % status["cancel_requested"])
+    return "running script %r for %ds (%s)" % (status["label"], status["running_for"],
+                                               ", ".join(extra))
+
+
 def _localhost_only(handler: http.server.BaseHTTPRequestHandler) -> Optional[str]:
     """Reject non-local peers, foreign Host headers (DNS rebinding) and browser requests."""
     if handler.client_address[0] != "127.0.0.1":
@@ -220,6 +335,10 @@ class ScriptBridge:
         self.main_thread_runner = main_thread_runner or (lambda fn: fn())
         self.lock = lock or UsageLock()
         self.run_mutex = threading.Lock()    # one script at a time
+        self.state = threading.Lock()        # guards current, queued, cancelled_ids
+        self.current: Optional[Run] = None
+        self.queued = 0
+        self.cancelled_ids: Dict[str, str] = {}   # run_id -> by, for runs not started yet
         bridge = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -259,14 +378,18 @@ class ScriptBridge:
                 if self.path == "/ping":
                     return _reply_json(self, 200, {"ok": True})
                 if self.path == "/lock":
-                    return _reply_json(self, 200, {"ok": True, "lock": bridge.lock.status()})
+                    return _reply_json(self, 200, {"ok": True, "lock": bridge.lock.status(),
+                                                   "running": bridge.running()})
+                if self.path == "/run":
+                    return _reply_json(self, 200, {"ok": True, "running": bridge.running(),
+                                                   "queued": bridge.queued})
                 _reply_json(self, 404, {"ok": False, "error": "not found"})
 
             def do_POST(self):
                 reason = self._refused()
                 if reason:
                     return _reply_json(self, 403, {"ok": False, "error": reason})
-                if self.path not in ("/run", "/lock", "/unlock"):
+                if self.path not in ("/run", "/lock", "/unlock", "/cancel"):
                     return _reply_json(self, 404, {"ok": False, "error": "not found"})
                 req = self._body()
                 if req is None:
@@ -275,6 +398,9 @@ class ScriptBridge:
                     return self._lock(req)
                 if self.path == "/unlock":
                     return self._unlock(req)
+                if self.path == "/cancel":
+                    return _reply_json(self, *bridge.cancel(
+                        req.get("session"), req.get("run_id"), bool(req.get("force"))))
                 code = req.get("code")
                 if not isinstance(code, str):
                     return _reply_json(self, 400, {"ok": False,
@@ -283,8 +409,20 @@ class ScriptBridge:
                 if not allowed:
                     return _reply_json(self, 423, {"ok": False, "lock": status,
                                                    "error": "Binary Ninja is " + describe(status)})
-                _reply_json(self, 200, bridge.execute(code, req.get("view"),
-                                                      bool(req.get("main_thread"))))
+                timeout = req.get("timeout")
+                if timeout is not None and (isinstance(timeout, bool) or
+                                            not isinstance(timeout, (int, float)) or timeout <= 0):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: timeout "
+                                                   "must be a positive number of seconds"})
+                run_id = req.get("run_id")
+                reply = bridge.execute(code, req.get("view"), bool(req.get("main_thread")),
+                                       session=req.get("session"), timeout=timeout,
+                                       run_id=run_id if isinstance(run_id, str) else None,
+                                       name=str(req.get("name") or ""))
+                try:
+                    _reply_json(self, 200, reply)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass    # client gone (interrupted); the script already finished or stopped
 
             def _lock(self, req):
                 session = req.get("session")
@@ -313,17 +451,152 @@ class ScriptBridge:
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self.port = self.httpd.server_address[1]
 
-    def execute(self, code: str, view: Optional[str], main_thread: bool) -> Dict[str, Any]:
-        with self.run_mutex:
+    def running(self) -> Optional[Dict[str, Any]]:
+        """Status of the script being run (see Run.status), or None when idle."""
+        with self.state:
+            return self.current.status() if self.current else None
+
+    def execute(self, code: str, view: Optional[str], main_thread: bool,
+                session: Optional[str] = None, timeout: Optional[float] = None,
+                run_id: Optional[str] = None, name: str = "") -> Dict[str, Any]:
+        run = Run(code, session if isinstance(session, str) else None, name, main_thread,
+                  float(timeout) if timeout else None, run_id or secrets.token_hex(16))
+        with self.state:
+            self.queued += 1
+        waiting = True
+        try:
+            with self.run_mutex:
+                with self.state:
+                    self.queued -= 1
+                    waiting = False
+                    self.current = run
+                    if run.run_id in self.cancelled_ids:
+                        run.cancel_by = self.cancelled_ids.pop(run.run_id)
+                try:
+                    if run.cancel_by is not None:
+                        return self._cancelled(run, "")
+                    try:
+                        namespace = self.namespace_factory(view)
+                    except LookupError as e:
+                        return {"ok": False, "stdout": "", "result": None, "error": str(e)}
+                    box: Dict[str, Any] = {}
+
+                    def job():
+                        box.update(self._run_guarded(run, code, namespace))
+                    if main_thread:
+                        self.main_thread_runner(job)
+                    else:
+                        job()
+                    return box or self._cancelled(run, "")
+                finally:
+                    if run.timer is not None:
+                        run.timer.cancel()
+                    with self.state:
+                        self.current = None
+        finally:
+            if waiting:
+                with self.state:
+                    self.queued -= 1
+
+    @staticmethod
+    def _cancelled(run: Run, stdout: str) -> Dict[str, Any]:
+        return {"ok": False, "stdout": stdout, "result": None, "error": "cancelled",
+                "cancelled_by": run.cancel_by}
+
+    def _run_guarded(self, run: Run, code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
+        """Run the script in the calling thread (a worker or the main thread) so that a cancel
+        can target it, and make sure no ScriptCancelled outlives the script."""
+        out = io.StringIO()
+        result: Optional[Dict[str, Any]] = None
+        begun = False
+        while True:     # a late ScriptCancelled may hit this bookkeeping: redo it until clean
             try:
-                namespace = self.namespace_factory(view)
-            except LookupError as e:
-                return {"ok": False, "stdout": "", "result": None, "error": str(e)}
-            if not main_thread:
-                return run_script(code, namespace)
-            box: Dict[str, Any] = {}
-            self.main_thread_runner(lambda: box.update(run_script(code, namespace)))
-            return box
+                if not begun:
+                    begun = True
+                    run.thread = threading.get_ident()
+                    run.started = time.time()
+                    run.executing = True
+                    if run.cancel_by is not None:   # cancelled before it began
+                        raise ScriptCancelled()
+                    if run.timeout:
+                        run.timer = threading.Timer(run.timeout, self._on_timeout, (run,))
+                        run.timer.daemon = True
+                        run.timer.start()
+                    result = run_script(code, namespace, out)
+                run.executing = False
+                while run.sending:          # a canceller is deciding: wait for its verdict
+                    time.sleep(0.001)
+                if run.exc_sent:            # clear a cancel that hasn't fired yet
+                    set_async_exc(run.thread, None)
+                break
+            except ScriptCancelled:
+                continue
+        if run.cancel_by is not None and (result is None or result.get("error") == "cancelled"):
+            return self._cancelled(run, out.getvalue())
+        return result if result is not None else self._cancelled(run, out.getvalue())
+
+    def _interrupt(self, run: Run) -> None:
+        """Raise ScriptCancelled in the script's thread if it is still executing. Holds state."""
+        if not run.executing:
+            return
+        run.sending = True
+        try:
+            if run.executing:
+                if set_async_exc(run.thread, ScriptCancelled):
+                    run.exc_sent = True
+        finally:
+            run.sending = False
+
+    def _on_timeout(self, run: Run) -> None:
+        with self.state:
+            if self.current is run and run.cancel_by is None:
+                run.cancel_by = "timeout after %gs" % run.timeout
+                self._interrupt(run)
+
+    def cancel(self, session: Optional[str] = None, run_id: Optional[str] = None,
+               force: bool = False) -> Tuple[int, Dict[str, Any]]:
+        """Cancel the running script: (HTTP status, reply).
+
+        Allowed for the session that started it, the usage-lock holder, whoever names its
+        run_id (only the client that sent /run knows it), or anyone with force. A run_id that
+        isn't running yet (queued, or not arrived) is remembered and won't start."""
+        session = session if isinstance(session, str) and session else None
+        run_id = run_id if isinstance(run_id, str) and run_id else None
+        holder = self.lock.status().get("session")
+        with self.state:
+            run = self.current
+            if run_id and (run is None or not hmac.compare_digest(run_id.encode(),
+                                                                  run.run_id.encode())):
+                self.cancelled_ids[run_id] = "its client"
+                while len(self.cancelled_ids) > 100:
+                    self.cancelled_ids.pop(next(iter(self.cancelled_ids)))
+                return 200, {"ok": True, "cancelled": None, "pending": True}
+            if run is None:
+                return 409, {"ok": False, "running": None, "error": "no script is running"}
+
+            def same(a, b):
+                return a is not None and b is not None and hmac.compare_digest(a.encode(),
+                                                                               b.encode())
+            if run_id:
+                by = "its client"
+            elif same(session, run.session):
+                by = "session %s" % session
+            elif same(session, holder):
+                by = "lock holder %s" % session
+            elif force:
+                by = "force by %s" % (session or "unknown session")
+            else:
+                return 403, {"ok": False, "running": run.status(),
+                             "error": "not allowed: the running script belongs to %s; you need "
+                                      "to be that session or the lock holder, or use force"
+                                      % (run.name or run.session or "no session")}
+            if run.cancel_by is None:
+                run.cancel_by = by
+            try:
+                self._interrupt(run)
+            except RuntimeError as e:
+                return 500, {"ok": False, "running": run.status(), "error": str(e)}
+            return 200, {"ok": True, "cancelled": run.status()}
 
     def start(self) -> None:
         threading.Thread(target=self.httpd.serve_forever, name="bn-script-bridge",

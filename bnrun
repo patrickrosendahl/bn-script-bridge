@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """Run a Python script inside the running Binary Ninja app through the script bridge.
 
-    bnrun [--view SUBSTRING] [--main-thread] [--json] [SCRIPT | -e CODE]
-    bnrun --status
+    bnrun [--view SUBSTRING] [--main-thread] [--json] [--timeout SECONDS] [SCRIPT | -e CODE]
+    bnrun --status                                     (usage lock + running script)
+    bnrun --cancel [--force]                           (cancel the running script)
     bnrun --lock [--purpose TEXT] [--ttl MINUTES]      (take or renew for this session)
     bnrun --unlock [--force]
 
 SCRIPT defaults to stdin. The script sees `bv` (the view whose filename contains SUBSTRING, or
 the one active in the UI), `bvs` (all open views) and `binaryninja`/`bn`; print() output comes
-back, and so does `result` if the script sets it. Exit status: 0 ok, 1 script error,
-2 bridge unreachable or refused, 3 Binary Ninja is locked by someone else.
+back, and so does `result` if the script sets it. Exit status: 0 ok, 1 script error (or
+cancelled), 2 bridge unreachable or refused, 3 Binary Ninja is locked by someone else,
+130 interrupted (Ctrl-C; the script is cancelled in Binary Ninja too).
+
+Cancelling: Ctrl-C (or SIGTERM) while waiting cancels this script inside Binary Ninja.
+--timeout SECONDS makes the bridge cancel it when it runs longer. --cancel cancels the running
+script if this session started it or holds the lock; --cancel --force cancels anyone's.
+Cancellation lands between Python bytecodes: a script blocked in a long native call
+(bv.update_analysis_and_wait(), time.sleep()) stops only when that call returns.
 
 Usage lock: no lock = Binary Ninja is free; a lock = one session is busy. The session is
 --session (default $CLAUDE_CODE_SESSION_ID), shown as --name (default $BN_SESSION_NAME). While
@@ -24,12 +32,14 @@ Config (port + token) is read from $BN_SCRIPT_BRIDGE_CONFIG or
 import argparse
 import json
 import os
+import secrets
+import signal
 import sys
 import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from bridge_server import describe  # noqa: E402
+from bridge_server import describe, describe_run  # noqa: E402
 
 DEFAULT_CONFIG = os.path.expanduser("~/Library/Application Support/Binary Ninja/script_bridge.json")
 
@@ -41,7 +51,8 @@ def main() -> int:
     ap.add_argument("--view", help="select the open view whose filename contains this")
     ap.add_argument("--main-thread", action="store_true", help="run on the UI thread")
     ap.add_argument("--json", action="store_true", help="print the raw JSON response")
-    ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--timeout", type=float, help="cancel the script in Binary Ninja after "
+                                                  "this many seconds of running")
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
                     help="this session's identity (default $CLAUDE_CODE_SESSION_ID)")
     ap.add_argument("--name", default=os.environ.get("BN_SESSION_NAME", ""),
@@ -50,12 +61,16 @@ def main() -> int:
     lock.add_argument("--status", action="store_true", help="show the usage lock")
     lock.add_argument("--lock", action="store_true", help="take or renew the lock")
     lock.add_argument("--unlock", action="store_true", help="release this session's lock")
+    lock.add_argument("--cancel", action="store_true", help="cancel the running script (this "
+                                                            "session's, or any as lock holder)")
     ap.add_argument("--purpose", default="", help="with --lock: what you are doing")
     ap.add_argument("--ttl", type=float, help="with --lock: minutes until it expires (default 5)")
     ap.add_argument("--force", action="store_true", help="with --unlock: release someone "
-                                                         "else's lock (stale locks)")
+                    "else's lock (stale locks); with --cancel: cancel someone else's script")
     args = ap.parse_args()
 
+    if args.cancel:
+        return cancel_command(args)
     if args.status or args.lock or args.unlock:
         return lock_command(args)
 
@@ -66,9 +81,22 @@ def main() -> int:
     else:
         code = sys.stdin.read()
 
-    status, reply = call("/run", {"code": code, "view": args.view,
-                                   "main_thread": args.main_thread, "session": args.session},
-                         args.timeout)
+    run_id = secrets.token_hex(16)    # lets Ctrl-C cancel exactly this run
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    try:
+        status, reply = call("/run", {"code": code, "view": args.view,
+                                       "main_thread": args.main_thread, "session": args.session,
+                                       "name": args.name, "timeout": args.timeout,
+                                       "run_id": run_id},
+                             args.timeout + 60 if args.timeout else None)
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)    # don't abort the cancel itself
+        status, _ = call("/cancel", {"run_id": run_id, "session": args.session}, 10)
+        print("\nbnrun: interrupted; %s" % ("script cancelled in Binary Ninja" if status == 200
+                                             else "couldn't cancel the script (see above)"),
+              file=sys.stderr)
+        return 130
     if status == 423:
         print("bnrun: Binary Ninja is %s" % describe(reply["lock"]), file=sys.stderr)
         return 3
@@ -82,13 +110,20 @@ def main() -> int:
         if reply.get("result") is not None:
             print(json.dumps(reply["result"], indent=2)
                   if not isinstance(reply["result"], str) else reply["result"])
-        if reply.get("error"):
+        if reply.get("error") == "cancelled":
+            print("bnrun: script cancelled (by %s)" % reply.get("cancelled_by"), file=sys.stderr)
+        elif reply.get("error"):
             sys.stderr.write(reply["error"])
     return 0 if reply.get("ok") else 1
 
 
-def call(path, body=None, timeout=30.0):
-    """(HTTP status, JSON reply); status 0 and a printed message if the bridge is unusable."""
+def _raise_interrupt(*_args):
+    raise KeyboardInterrupt
+
+
+def call(path, body=None, timeout=30.0, passthrough=(409, 423)):
+    """(HTTP status, JSON reply); status 0 and a printed message if the bridge is unusable.
+    Error statuses in `passthrough` return their JSON reply without printing anything."""
     config_path = os.environ.get("BN_SCRIPT_BRIDGE_CONFIG", DEFAULT_CONFIG)
     try:
         config = json.load(open(config_path))
@@ -106,7 +141,7 @@ def call(path, body=None, timeout=30.0):
             return resp.status, json.load(resp)
     except urllib.error.HTTPError as e:
         text = e.read().decode(errors="replace")
-        if e.code in (409, 423):
+        if e.code in passthrough:
             return e.code, json.loads(text)
         print("bnrun: refused (%d): %s" % (e.code, text), file=sys.stderr)
         return e.code, {}
@@ -121,6 +156,7 @@ def lock_command(args) -> int:
         if status != 200:
             return 2
         print(describe(reply["lock"]))
+        print(describe_run(reply.get("running")))
         return 3 if reply["lock"].get("locked") else 0
     if args.lock:
         if not args.session:
@@ -145,6 +181,18 @@ def lock_command(args) -> int:
         return 2
     print("released" if reply["released"].get("locked") else "was already free")
     return 0
+
+
+def cancel_command(args) -> int:
+    status, reply = call("/cancel", {"session": args.session, "force": args.force},
+                         passthrough=(403, 409))
+    if status == 200:
+        print("cancel sent: %s" % describe_run(reply["cancelled"]))
+        return 0
+    if status in (403, 409):
+        print("bnrun: %s" % reply["error"], file=sys.stderr)
+        return 3 if status == 403 else 1
+    return 2
 
 
 if __name__ == "__main__":
