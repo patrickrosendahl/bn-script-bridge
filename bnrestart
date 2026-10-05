@@ -61,7 +61,8 @@ def main() -> int:
     files = []
     if running():
         status = bnrun("--status")
-        if status.returncode != 0:
+        # --status exits non-zero while a lock is held; it reached the bridge if it printed a status
+        if not status.stdout.startswith(("free", "locked")):
             print("bnrestart: bridge unreachable: %s" % (status.stdout + status.stderr).strip(), file=sys.stderr)
             if not args.force:
                 return 2
