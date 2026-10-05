@@ -104,7 +104,9 @@ def main() -> int:
 
     reopen = [] if args.no_reopen else files
     print("bnrestart: launching Binary Ninja" + (" with %d file(s)" % len(reopen) if reopen else ""))
-    subprocess.run(["open", "-a", APP, *reopen], check=False)
+    # -g: relaunch in the background so the restart doesn't steal focus. Which Space (desktop) the
+    # window lands on is macOS's choice: pin it via Dock > Binary Ninja > Options > Assign To.
+    subprocess.run(["open", "-g", "-a", APP, *reopen], check=False)
     deadline = time.time() + args.wait
     while time.time() < deadline:
         time.sleep(1)

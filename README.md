@@ -84,6 +84,11 @@ the previously open files (their `.bndb` where one exists; `--no-reopen` skips t
 until the bridge answers. Exit 0 ok, 1 did not quit / did not come back, 2 bridge unreachable,
 3 refused. It restarts the GUI for every session sharing it, so coordinate.
 
+The app is relaunched in the background (`open -g`) and Binary Ninja restores its own window
+geometry. Which macOS Space (desktop) it opens on is up to macOS — new launches go to the active
+Space. To keep it on its own desktop, assign it once: Dock → right-click Binary Ninja → Options →
+Assign To → This Desktop.
+
 ## Usage lock (coordinating sessions)
 
 Several sessions share one Binary Ninja. The plugin keeps one usage lock for all of them:
