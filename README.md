@@ -74,15 +74,20 @@ Endpoints: `GET /run` (running script and queue length; `GET /lock` includes it 
 
 ## Restarting Binary Ninja
 
-    bnrestart [--force] [--no-save] [--no-reopen] [--wait SECONDS]
+    bnrestart [--force] [--save-new | --discard] [--no-reopen] [--wait SECONDS]
 
 Loads changed plugin code by restarting the app. Refuses (exit 3) while another session holds
-the usage lock or a script is running (`--force` overrides). Views with unsaved changes are
-saved first — into their `.bndb`, or a new `<file>.bndb` next to the binary (`--no-save` refuses
-instead) — so the quit never blocks on a save dialog. It quits via AppleScript, relaunches with
-the previously open files (their `.bndb` where one exists; `--no-reopen` skips that) and waits
-until the bridge answers. Exit 0 ok, 1 did not quit / did not come back, 2 bridge unreachable,
-3 refused. It restarts the GUI for every session sharing it, so coordinate.
+the usage lock or a script is running (`--force` overrides). Unsaved changes — note that analysis
+alone marks a view modified:
+- views that already have a `.bndb` are saved into it;
+- other modified views make it refuse, unless `--save-new` (create `<file>.bndb` next to the
+  binary) or `--discard` (quit without saving: SIGTERM, then SIGKILL after 15 s — the Qt UI
+  ignores AppleScript's `saving no` and would block on its own save prompt).
+
+Otherwise it quits via AppleScript, relaunches with the previously open files (their `.bndb` where
+one exists; `--no-reopen` skips that) and waits until the bridge answers. Exit 0 ok, 1 did not
+quit / did not come back, 2 bridge unreachable, 3 refused. It restarts the GUI for every session
+sharing it, so coordinate.
 
 The app is relaunched in the background (`open -g`) and Binary Ninja restores its own window
 geometry. Which macOS Space (desktop) it opens on is up to macOS — new launches go to the active
