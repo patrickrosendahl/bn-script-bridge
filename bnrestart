@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Restart the running Binary Ninja app (e.g. to load changed plugin code) and wait for the bridge.
+
+    bnrestart [--force] [--no-save] [--no-reopen] [--wait SECONDS]
+
+Refuses (exit 3) when another session holds the usage lock or a bridge script is running --
+unless --force. Open files with unsaved changes are saved first (into their .bndb, or a new
+<file>.bndb next to the binary), so quitting never blocks on a save dialog; with --no-save it
+refuses instead.
+Quits Binary Ninja via AppleScript, waits for the process to exit, relaunches it with the files
+that were open (unless --no-reopen), then waits until the script bridge answers again.
+Exit status: 0 ok, 1 Binary Ninja did not quit / did not come back, 2 bridge unreachable before
+the restart, 3 refused.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+BNRUN = os.path.join(HERE, "bnrun")
+APP = "/Applications/Binary Ninja.app"
+PROCESS = APP + "/Contents/MacOS/binaryninja"
+
+
+SAVE_SCRIPT = """
+done = set()
+for v in bvs:
+    f = v.file
+    if not f.modified or f.filename in done:
+        continue
+    done.add(f.filename)
+    if f.has_database:
+        ok = f.save_auto_snapshot()
+    else:
+        ok = v.create_database(f.filename + ".bndb")
+    print(("saved " if ok else "FAILED to save ") + f.filename)
+    if not ok:
+        raise RuntimeError("save failed: " + f.filename)
+"""
+
+
+def bnrun(*args, timeout=30):
+    return subprocess.run([BNRUN, *args], capture_output=True, text=True, timeout=timeout)
+
+
+def running() -> bool:
+    return subprocess.run(["pgrep", "-f", PROCESS], capture_output=True).returncode == 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--force", action="store_true", help="restart despite lock/script/unsaved files")
+    ap.add_argument("--no-save", action="store_true", help="refuse instead of saving modified files")
+    ap.add_argument("--no-reopen", action="store_true", help="don't reopen the previously open files")
+    ap.add_argument("--wait", type=float, default=90, help="seconds to wait for quit and for the bridge")
+    args = ap.parse_args()
+
+    files = []
+    if running():
+        status = bnrun("--status")
+        if status.returncode != 0:
+            print("bnrestart: bridge unreachable: %s" % (status.stdout + status.stderr).strip(), file=sys.stderr)
+            if not args.force:
+                return 2
+        else:
+            text = status.stdout
+            me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            locked_by_other = text.startswith("locked") and (not me or ("session %s)" % me) not in text)
+            busy = "no script running" not in text
+            if (locked_by_other or busy) and not args.force:
+                print("bnrestart: refused, Binary Ninja is in use:\n" + text.strip(), file=sys.stderr)
+                return 3
+            views = bnrun("--timeout", "10", "-e",
+                          "result = [{'file': v.file.filename, 'modified': v.file.modified} for v in bvs]")
+            try:
+                views = json.loads(views.stdout.strip().splitlines()[-1]) if views.returncode == 0 else []
+            except (ValueError, IndexError):
+                views = []
+            unsaved = sorted({v["file"] for v in views if v.get("modified")})
+            if unsaved and args.no_save and not args.force:
+                print("bnrestart: refused, unsaved changes in:\n  " + "\n  ".join(unsaved), file=sys.stderr)
+                return 3
+            if unsaved and not args.no_save:
+                saved = bnrun("--timeout", "120", "-e", SAVE_SCRIPT, timeout=180)
+                print(saved.stdout.strip())
+                if saved.returncode != 0:
+                    print("bnrestart: saving failed, not restarting:\n" + saved.stderr.strip(), file=sys.stderr)
+                    return 1
+            # reopen the database where there is one (including any just created above)
+            files = sorted({v["file"] + ".bndb" if os.path.exists(v["file"] + ".bndb") else v["file"]
+                            for v in views if os.path.exists(v["file"])})
+
+        print("bnrestart: quitting Binary Ninja")
+        subprocess.run(["osascript", "-e", 'tell application "Binary Ninja" to quit'], capture_output=True)
+        deadline = time.time() + args.wait
+        while running() and time.time() < deadline:
+            time.sleep(0.5)
+        if running():
+            print("bnrestart: Binary Ninja did not quit (a dialog may be waiting in the GUI)", file=sys.stderr)
+            return 1
+
+    reopen = [] if args.no_reopen else files
+    print("bnrestart: launching Binary Ninja" + (" with %d file(s)" % len(reopen) if reopen else ""))
+    subprocess.run(["open", "-a", APP, *reopen], check=False)
+    deadline = time.time() + args.wait
+    while time.time() < deadline:
+        time.sleep(1)
+        try:
+            if bnrun("--status", timeout=5).returncode == 0:
+                print("bnrestart: bridge is up")
+                return 0
+        except subprocess.TimeoutExpired:
+            pass
+    print("bnrestart: Binary Ninja started but the bridge did not answer within %ds "
+          "(check Plugins > Script Bridge > Start)" % args.wait, file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -72,6 +72,18 @@ Endpoints: `GET /run` (running script and queue length; `GET /lock` includes it 
 `POST /cancel {"session", "run_id", "force"}`; `POST /run` takes `"timeout"` (seconds) and
 `"run_id"`. Cancellation needs this plugin version loaded: restart Binary Ninja after updating.
 
+## Restarting Binary Ninja
+
+    bnrestart [--force] [--no-save] [--no-reopen] [--wait SECONDS]
+
+Loads changed plugin code by restarting the app. Refuses (exit 3) while another session holds
+the usage lock or a script is running (`--force` overrides). Views with unsaved changes are
+saved first — into their `.bndb`, or a new `<file>.bndb` next to the binary (`--no-save` refuses
+instead) — so the quit never blocks on a save dialog. It quits via AppleScript, relaunches with
+the previously open files (their `.bndb` where one exists; `--no-reopen` skips that) and waits
+until the bridge answers. Exit 0 ok, 1 did not quit / did not come back, 2 bridge unreachable,
+3 refused. It restarts the GUI for every session sharing it, so coordinate.
+
 ## Usage lock (coordinating sessions)
 
 Several sessions share one Binary Ninja. The plugin keeps one usage lock for all of them:
