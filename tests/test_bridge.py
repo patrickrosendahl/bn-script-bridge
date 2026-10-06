@@ -73,6 +73,11 @@ class BridgeFixture(unittest.TestCase):
         conn.close()
         return reply
 
+    def hold_lock(self, session="me"):
+        """Take the usage lock: UI views (bv, bvs, view, main_thread) need it."""
+        status, _ = self.request("POST", "/lock", {"session": session})
+        self.assertEqual(status, 200)
+
     def bnrun(self, *args, stdin=""):
         env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config)
         return subprocess.run([sys.executable, BNRUN, *args], input=stdin, capture_output=True,
@@ -84,8 +89,10 @@ class BridgeTest(BridgeFixture):
         self.assertEqual(self.request("GET", "/ping"), (200, {"ok": True}))
 
     def test_runs_script_with_stdout_and_result(self):
+        self.hold_lock()
         status, reply = self.request("POST", "/run", {
-            "code": "print('hello', bv.file.filename)\nresult = {'n': len(bvs)}"})
+            "code": "print('hello', bv.file.filename)\nresult = {'n': len(bvs)}",
+            "session": "me"})
         self.assertEqual(status, 200)
         self.assertTrue(reply["ok"])
         self.assertEqual(reply["stdout"], "hello /x/DM365_AllegroIndoor_debug.bndb\n")
@@ -96,10 +103,12 @@ class BridgeTest(BridgeFixture):
         self.assertEqual(reply["result"], "<class 'object'>")
 
     def test_view_selection(self):
+        self.hold_lock()
         _, reply = self.request("POST", "/run", {"code": "result = bv.file.filename",
-                                                 "view": "cx20707"})
+                                                 "view": "cx20707", "session": "me"})
         self.assertEqual(reply["result"], "/x/cx20707.ko.bndb")
-        _, reply = self.request("POST", "/run", {"code": "pass", "view": "bndb"})
+        _, reply = self.request("POST", "/run", {"code": "pass", "view": "bndb",
+                                                 "session": "me"})
         self.assertFalse(reply["ok"])
         self.assertIn("matches 2 open views", reply["error"])
 
@@ -110,9 +119,11 @@ class BridgeTest(BridgeFixture):
         self.assertIn("ZeroDivisionError", reply["error"])
 
     def test_main_thread_runner_used_on_request(self):
+        self.hold_lock()
         self.request("POST", "/run", {"code": "pass"})
         self.assertEqual(self.main_calls, [])
-        _, reply = self.request("POST", "/run", {"code": "result = 1", "main_thread": True})
+        _, reply = self.request("POST", "/run", {"code": "result = 1", "main_thread": True,
+                                                 "session": "me"})
         self.assertEqual(reply["result"], 1)
         self.assertEqual(len(self.main_calls), 1)
 
@@ -140,9 +151,10 @@ class BridgeTest(BridgeFixture):
     def test_bnrun_client(self):
         r = self.bnrun("-e", "print('x'); result = [1, 2]")
         self.assertEqual((r.returncode, r.stdout), (0, "x\n[\n  1,\n  2\n]\n"))
-        r = self.bnrun("--view", "cx20707", stdin="print(bv.file.filename)")
+        self.hold_lock()
+        r = self.bnrun("--session", "me", "--view", "cx20707", stdin="print(bv.file.filename)")
         self.assertEqual((r.returncode, r.stdout), (0, "/x/cx20707.ko.bndb\n"))
-        r = self.bnrun("-e", "raise ValueError('boom')")
+        r = self.bnrun("--session", "me", "-e", "raise ValueError('boom')")
         self.assertEqual(r.returncode, 1)
         self.assertIn("ValueError: boom", r.stderr)
 
@@ -295,7 +307,9 @@ class CancelTest(BridgeFixture):
     def assert_idle_and_usable(self):
         self.assertFalse(self.bridge.run_mutex.locked())
         self.assertEqual(self.request("GET", "/run")[1], {"ok": True, "running": None,
-                                                          "queued": 0})
+                                                          "queued": 0, "parallel": [],
+                                                          "parallel_queued": 0,
+                                                          "max_parallel": 4})
         status, reply = self.request("POST", "/run", {"code": "result = sum(range(100000))"})
         self.assertEqual((status, reply["ok"], reply["result"]), (200, True, 4999950000))
 
@@ -402,12 +416,15 @@ class CancelTest(BridgeFixture):
             jobs.append((fn, done))
             done.wait()
         self.bridge.main_thread_runner = runner
+        self.hold_lock("s")
         t, box = self.run_async({"code": BUSY, "main_thread": True, "session": "s"})
         self.wait_running()
         self.assertEqual(self.request("POST", "/cancel", {"session": "s"})[0], 200)
         t.join(10)
         self.assertEqual(box["reply"][1]["error"], "cancelled")
-        _, reply = self.request("POST", "/run", {"code": "result = 2", "main_thread": True})
+        _, reply = self.request("POST", "/run", {"code": "result = 2", "main_thread": True,
+                                                 "session": "s"})
+        self.request("POST", "/unlock", {"session": "s"})
         self.assertEqual(reply["result"], 2)
         self.assertEqual(executed_on, [main.ident, main.ident])
         stop.set()
@@ -463,6 +480,254 @@ class CancelTest(BridgeFixture):
                     break
                 time.sleep(0.01)
             self.assert_idle_and_usable()
+
+
+# Waits (in small, cancellable steps) until the test sets `gate`, which it gets from base_namespace.
+GATED = "print('started')\nwhile not gate.is_set():\n    time.sleep(0.005)\nresult = 'done'\n"
+
+# Counts how many scripts run at once (in the shared `meter`, from base_namespace).
+METERED = """
+with meter['lock']:
+    meter['now'] += 1
+    meter['max'] = max(meter['max'], meter['now'])
+time.sleep(0.3)
+with meter['lock']:
+    meter['now'] -= 1
+"""
+
+
+class ParallelTest(BridgeFixture):
+    run_async = CancelTest.run_async
+    assert_idle_and_usable = CancelTest.assert_idle_and_usable
+
+    def setUp(self):
+        super().setUp()
+        self.gate = threading.Event()
+        self.meter = {"lock": threading.Lock(), "now": 0, "max": 0}
+        self.bridge.base_namespace = {"time": time, "gate": self.gate, "meter": self.meter,
+                                      "barrier": threading.Barrier(2)}
+
+    def tearDown(self):
+        self.gate.set()
+        super().tearDown()
+
+    def wait_for(self, predicate, what):
+        for _ in range(1000):
+            status = self.request("GET", "/run")[1]
+            if predicate(status):
+                return status
+            time.sleep(0.01)
+        self.fail("timed out waiting for " + what)
+
+    def running_parallel(self, n):
+        return self.wait_for(lambda st: len([r for r in st["parallel"]
+                                             if r["state"] == "running"]) == n,
+                             "%d parallel runs" % n)
+
+    def test_two_parallel_scripts_overlap(self):
+        code = "barrier.wait(5)\nresult = 'met'"   # passes only if both run at the same time
+        runs = [self.run_async({"code": code, "parallel": True}) for _ in range(2)]
+        for t, box in runs:
+            t.join(10)
+            self.assertEqual(box["reply"][1]["result"], "met", box["reply"])
+        self.assert_idle_and_usable()
+
+    def test_serialized_and_parallel_overlap(self):
+        code = "barrier.wait(5)\nresult = 'met'"
+        runs = [self.run_async({"code": code, "parallel": p}) for p in (False, True)]
+        for t, box in runs:
+            t.join(10)
+            self.assertEqual(box["reply"][1]["result"], "met", box["reply"])
+
+    def test_serialized_still_one_at_a_time(self):
+        runs = [self.run_async({"code": METERED}) for _ in range(3)]
+        for t, box in runs:
+            t.join(10)
+            self.assertTrue(box["reply"][1]["ok"], box["reply"])
+        self.assertEqual(self.meter["max"], 1)
+        runs = [self.run_async({"code": METERED, "parallel": True}) for _ in range(3)]
+        for t, box in runs:
+            t.join(10)
+            self.assertTrue(box["reply"][1]["ok"], box["reply"])
+        self.assertEqual(self.meter["max"], 3)
+
+    def test_max_parallel_limit_queues(self):
+        self.bridge.max_parallel = lambda: 2        # like the scriptbridge.maxParallel setting
+        runs = [self.run_async({"code": GATED, "parallel": True, "name": "p%d" % i})
+                for i in range(3)]
+        status = self.wait_for(lambda st: len(st["parallel"]) == 2 and st["parallel_queued"] == 1,
+                               "2 running + 1 queued")
+        self.assertEqual((status["max_parallel"], status["running"], status["queued"]),
+                         (2, None, 0))
+        self.assertTrue(all(r["parallel"] for r in status["parallel"]))
+        r = self.bnrun("--status")
+        self.assertEqual(r.stdout.count("running script \"print('started')\""), 2, r.stdout)
+        self.assertEqual(r.stdout.count(", parallel)"), 2, r.stdout)
+        self.assertIn("queued: 0 serialized, 1 parallel", r.stdout)
+        self.assertNotIn("no script running", r.stdout)            # what bnrestart checks
+        _, reply = self.request("POST", "/run", {"code": "result = 'serialized'"})
+        self.assertEqual(reply["result"], "serialized")             # not stuck behind them
+        self.gate.set()
+        for t, box in runs:
+            t.join(10)
+            self.assertEqual(box["reply"][1]["result"], "done")
+        self.bridge.max_parallel = 4
+        self.assert_idle_and_usable()
+
+    def test_cancel_hits_only_that_run(self):
+        a, box_a = self.run_async({"code": GATED, "parallel": True, "session": "sess-a"})
+        b, box_b = self.run_async({"code": GATED, "parallel": True, "session": "sess-b"})
+        c, box_c = self.run_async({"code": GATED, "session": "sess-c"})
+        self.running_parallel(2)
+        self.wait_for(lambda st: st["running"] and st["running"]["state"] == "running",
+                      "serialized run")
+        status, reply = self.request("POST", "/cancel", {"session": "sess-a"})
+        self.assertEqual(status, 200)
+        self.assertEqual([r["session"] for r in reply["cancelled_runs"]], ["sess-a"])
+        a.join(10)
+        self.assertEqual((box_a["reply"][1]["error"], box_a["reply"][1]["cancelled_by"]),
+                         ("cancelled", "session sess-a"))
+        status = self.request("GET", "/run")[1]
+        self.assertEqual([r["session"] for r in status["parallel"]], ["sess-b"])
+        self.assertEqual(status["running"]["session"], "sess-c")
+        self.assertEqual(self.request("POST", "/cancel", {"session": "sess-x"})[0], 403)
+        r = self.bnrun("--cancel", "--force", "--session", "sess-x")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.count("cancel sent"), 2, r.stdout)
+        for t, box in ((b, box_b), (c, box_c)):
+            t.join(10)
+            self.assertEqual(box["reply"][1]["cancelled_by"], "force by sess-x")
+        self.assert_idle_and_usable()
+
+    def test_timeout_and_run_id_hit_only_that_run(self):
+        other, box_other = self.run_async({"code": GATED, "parallel": True, "run_id": "keep"})
+        self.running_parallel(1)
+        status, reply = self.request("POST", "/run", {"code": GATED, "parallel": True,
+                                                      "timeout": 0.3})
+        self.assertEqual((reply["error"], reply["cancelled_by"]),
+                         ("cancelled", "timeout after 0.3s"))
+        self.bridge.max_parallel = 1                 # a second run now queues for the slot
+        q, box_q = self.run_async({"code": GATED, "parallel": True, "run_id": "queued"})
+        self.wait_for(lambda st: st["parallel_queued"] == 1, "queued parallel run")
+        self.assertEqual(self.request("POST", "/cancel", {"run_id": "queued"})[1]["pending"], True)
+        q.join(5)
+        self.assertEqual(box_q["reply"][1]["error"], "cancelled")
+        self.assertTrue(other.is_alive())
+        self.gate.set()
+        other.join(10)
+        self.assertEqual(box_other["reply"][1]["result"], "done")
+        self.bridge.max_parallel = 4
+        self.assert_idle_and_usable()
+
+    def test_parallel_with_main_thread_rejected(self):
+        status, reply = self.request("POST", "/run", {"code": "pass", "parallel": True,
+                                                      "main_thread": True})
+        self.assertEqual(status, 400)
+        self.assertIn("main thread", reply["error"])
+        r = self.bnrun("--parallel", "--main-thread", "-e", "pass")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--parallel can't be combined with --main-thread", r.stderr)
+        self.assertEqual(self.main_calls, [])
+
+    def test_lock_rules_apply_to_parallel(self):
+        self.hold_lock("sess-fe")
+        status, reply = self.request("POST", "/run", {"code": "pass", "parallel": True,
+                                                      "session": "sess-audio"})
+        self.assertEqual(status, 423)
+        r = self.bnrun("--parallel", "--session", "sess-audio", "-e", "pass")
+        self.assertEqual(r.returncode, 3)
+        # the holder's parallel script runs next to its own serialized one (no self-deadlock)
+        t, box = self.run_async({"code": GATED, "session": "sess-fe"})
+        self.wait_for(lambda st: st["running"] and st["running"]["state"] == "running",
+                      "serialized run")
+        _, reply = self.request("POST", "/run", {"code": "result = 1", "parallel": True,
+                                                 "session": "sess-fe"})
+        self.assertEqual(reply["result"], 1)
+        self.gate.set()
+        t.join(10)
+        self.assertEqual(box["reply"][1]["result"], "done")
+
+
+class UIViewRulesTest(BridgeFixture):
+    """UI views (bv, bvs, view, main_thread) only for a serialized script of the lock holder."""
+
+    def setUp(self):
+        super().setUp()
+        self.bridge.base_namespace = {"bn": "the-api"}
+
+    def run_code(self, code, **kw):
+        return self.request("POST", "/run", dict(kw, code=code))
+
+    def test_without_lock_bv_and_bvs_refuse_but_the_api_is_there(self):
+        _, reply = self.run_code("result = bn")
+        self.assertEqual(reply["result"], "the-api")
+        for code in ("bv.functions", "len(bvs)", "list(bvs)", "bool(bv)", "bvs[0]"):
+            _, reply = self.run_code(code)
+            self.assertFalse(reply["ok"], code)
+            self.assertIn("UIViewsUnavailable", reply["error"], code)
+            self.assertIn("take the usage lock first: bnrun --lock", reply["error"], code)
+        _, reply = self.run_code("result = repr(bv)")
+        self.assertIn("no UI views", reply["result"])
+        _, reply = self.run_code("try:\n    bv.x\nexcept RuntimeError as e:\n    result = 'caught'")
+        self.assertEqual(reply["result"], "caught")     # a RuntimeError, so scripts can test
+
+    def test_view_and_main_thread_need_the_lock(self):
+        for kw in ({"view": "cx20707"}, {"main_thread": True}):
+            status, reply = self.run_code("pass", session="me", **kw)
+            self.assertEqual(status, 409, kw)
+            self.assertIn("take the usage lock first", reply["error"])
+        self.assertEqual(self.main_calls, [])
+        r = self.bnrun("--session", "me", "--view", "cx20707", "-e", "pass")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("take the usage lock first: bnrun --lock", r.stderr)
+        self.hold_lock()
+        _, reply = self.run_code("result = bv.file.filename", session="me", view="cx20707")
+        self.assertEqual(reply["result"], "/x/cx20707.ko.bndb")
+        _, reply = self.run_code("result = (len(bvs), bn)", session="me")
+        self.assertEqual(reply["result"], [2, "the-api"])
+        _, reply = self.run_code("result = 1", session="me", main_thread=True)
+        self.assertEqual((reply["result"], len(self.main_calls)), (1, 1))
+        _, reply = self.run_code("bv.file", session="other-but-lock-is-mine")
+        self.assertEqual(reply.get("lock", {}).get("session"), "me")    # 423: locked
+
+    def test_parallel_gets_no_ui_views_even_for_the_holder(self):
+        self.hold_lock()
+        status, reply = self.run_code("pass", session="me", parallel=True, view="cx20707")
+        self.assertEqual(status, 400)
+        self.assertIn("parallel scripts get no UI views", reply["error"])
+        _, reply = self.run_code("bv.file", session="me", parallel=True)
+        self.assertIn("parallel scripts get no UI views", reply["error"])
+        _, reply = self.run_code("result = bn", session="me", parallel=True)
+        self.assertEqual(reply["result"], "the-api")
+        r = self.bnrun("--parallel", "--view", "x", "-e", "pass")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--parallel can't be combined with --view", r.stderr)
+
+    def test_lock_lost_while_queued_refuses_the_view(self):
+        self.hold_lock()
+        self.bridge.base_namespace = {"gate": threading.Event(), "time": time}
+        gate = self.bridge.base_namespace["gate"]
+        box = {}
+        t = threading.Thread(target=lambda: box.update(reply=self.run_code(
+            "while not gate.is_set():\n    time.sleep(0.005)", session="me")), daemon=True)
+        t.start()
+        for _ in range(500):
+            if self.bridge.running():
+                break
+            time.sleep(0.01)
+        t2 = threading.Thread(target=lambda: box.update(reply2=self.run_code(
+            "result = bv.file.filename", session="me", view="cx20707")), daemon=True)
+        t2.start()
+        for _ in range(500):
+            if self.bridge.queued == 1:
+                break
+            time.sleep(0.01)
+        self.request("POST", "/unlock", {"session": "me"})
+        gate.set()
+        t.join(10)
+        t2.join(10)
+        self.assertFalse(box["reply2"][1]["ok"])
+        self.assertIn("take the usage lock first", box["reply2"][1]["error"])
 
 
 class FakeMcpUpstream:

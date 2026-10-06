@@ -47,6 +47,7 @@ def _open_views():
 
 
 def _namespace(view_filter):
+    """The UI views for a script allowed to use them (serialized, session holds the lock)."""
     box = {}
     execute_on_main_thread_and_wait(lambda: box.update(zip(("views", "active"), _open_views())))
     views, active = box["views"], box["active"]
@@ -147,8 +148,10 @@ def start(*_args):
         return
     token = bridge_server.new_token()
     lock = bridge_server.UsageLock(listener=_log_lock)
-    _bridge = bridge_server.ScriptBridge(token, _namespace, execute_on_main_thread_and_wait,
-                                         lock=lock)
+    _bridge = bridge_server.ScriptBridge(
+        token, _namespace, execute_on_main_thread_and_wait, lock=lock,
+        max_parallel=lambda: Settings().get_integer("scriptbridge.maxParallel"),
+        base_namespace={"binaryninja": binaryninja, "bn": binaryninja})
     try:
         settings = Settings()
         _proxy = bridge_server.McpProxy(lock, settings.get_integer("ui.mcp.port"),
@@ -194,6 +197,17 @@ Settings().register_setting("scriptbridge.autostart", json.dumps({
     "default": False,
     "description": "Listen on 127.0.0.1 for token-authenticated scripts from bnrun "
                    "(bn-script-bridge). Anyone with the token can run code in Binary Ninja.",
+    "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
+}))
+Settings().register_setting("scriptbridge.maxParallel", json.dumps({
+    "title": "Maximum parallel scripts",
+    "type": "number",
+    "default": bridge_server.DEFAULT_MAX_PARALLEL,
+    "minValue": 1,
+    "maxValue": 64,
+    "description": "How many `bnrun --parallel` scripts (scripts that only work on their own "
+                   "views) may run at once; more wait for a slot. Serialized scripts are not "
+                   "counted. Read whenever a parallel script waits, so changes apply at once.",
     "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
 }))
 Settings().register_setting("scriptbridge.mcpProxyPort", json.dumps({

@@ -3,8 +3,10 @@
 
     bnrestart [--force] [--save-new | --discard] [--no-reopen] [--wait SECONDS]
 
-Refuses (exit 3) when another session holds the usage lock or a bridge script is running --
-unless --force. Unsaved changes (analysis alone marks a view modified):
+Refuses (exit 3) when another session holds the usage lock or a bridge script is running or
+queued in either lane (serialized or --parallel) -- unless --force. It takes the usage lock
+itself (as $CLAUDE_CODE_SESSION_ID, else bnrestart-<pid>) while it lists and saves the open
+views, since UI views are only visible to the lock holder; the restart clears the lock. Unsaved changes (analysis alone marks a view modified):
   - views that already have a .bndb are saved into it;
   - other modified views make it refuse, unless --save-new (create <file>.bndb next to the binary)
     or --discard (quit without saving: SIGTERM, since the Qt UI would otherwise show its own
@@ -46,8 +48,21 @@ for v in bvs:
 """
 
 
+SESSION = os.environ.get("CLAUDE_CODE_SESSION_ID") or "bnrestart-%d" % os.getpid()
+
+
 def bnrun(*args, timeout=30):
-    return subprocess.run([BNRUN, *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run([BNRUN, "--session", SESSION, *args], capture_output=True, text=True,
+                          timeout=timeout)
+
+
+TOOK_LOCK = False
+
+
+def release_lock():
+    """Give back the lock bnrestart took (not one this session held before)."""
+    if TOOK_LOCK:
+        bnrun("--unlock")
 
 
 def running() -> bool:
@@ -55,6 +70,7 @@ def running() -> bool:
 
 
 def main() -> int:
+    global TOOK_LOCK
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--force", action="store_true", help="restart despite lock/script/unsaved files")
     mode = ap.add_mutually_exclusive_group()
@@ -76,10 +92,20 @@ def main() -> int:
             text = status.stdout
             me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
             locked_by_other = text.startswith("locked") and (not me or ("session %s)" % me) not in text)
+            # bnrun --status prints "no script running" only when both lanes are idle
             busy = "no script running" not in text
             if (locked_by_other or busy) and not args.force:
                 print("bnrestart: refused, Binary Ninja is in use:\n" + text.strip(), file=sys.stderr)
                 return 3
+            # bvs (the UI views) are only given to the lock holder's scripts
+            held_before = text.startswith("locked") and not locked_by_other
+            locked = bnrun("--lock", "--purpose", "bnrestart: saving views and restarting")
+            TOOK_LOCK = locked.returncode == 0 and not held_before
+            if locked.returncode != 0:
+                print("bnrestart: couldn't take the usage lock: %s"
+                      % (locked.stdout + locked.stderr).strip(), file=sys.stderr)
+                if not args.force:
+                    return 3
             views = bnrun("--timeout", "10", "-e",
                           "result = [{'file': v.file.filename, 'modified': v.file.modified, "
                           "'db': v.file.has_database} for v in bvs]")
@@ -92,6 +118,7 @@ def main() -> int:
                 print("bnrestart: refused, modified views without a database (would need a new .bndb):\n  " +
                       "\n  ".join(unsaved_new) + "\nuse --save-new to create <file>.bndb, or --discard",
                       file=sys.stderr)
+                release_lock()
                 return 3
             if any(v.get("modified") for v in views) and not args.discard:
                 script = SAVE_SCRIPT.replace("SAVE_NEW", "True" if args.save_new else "False")
@@ -99,6 +126,7 @@ def main() -> int:
                 print(saved.stdout.strip())
                 if saved.returncode != 0:
                     print("bnrestart: saving failed, not restarting:\n" + saved.stderr.strip(), file=sys.stderr)
+                    release_lock()
                     return 1
             # reopen the database where there is one (including any just created above)
             files = sorted({v["file"] + ".bndb" if os.path.exists(v["file"] + ".bndb") else v["file"]
@@ -118,6 +146,7 @@ def main() -> int:
             time.sleep(2)
         if running():
             print("bnrestart: Binary Ninja did not quit (a dialog may be waiting in the GUI)", file=sys.stderr)
+            release_lock()
             return 1
 
     reopen = [] if args.no_reopen else files

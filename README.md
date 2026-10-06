@@ -24,38 +24,88 @@ instance, coordinate the restart. `bnrun` can be run from here or symlinked onto
 2. From a shell:
 
 ```sh
+bnrun --lock --purpose "listing functions"        # UI views need the usage lock
 bnrun -e 'print(len(list(bv.functions)))'
 bnrun --view cx20707.ko script.py
 echo 'result = [f.name for f in bv.functions][:10]' | bnrun
+bnrun --unlock
+
+bnrun --parallel --timeout 600 tests/check_my_classes.py   # own throwaway views, no lock
 ```
 
 The script sees:
 
+- `binaryninja` / `bn`: the API module (always);
 - `bv`: the open view whose filename contains `--view`, else the view active in the UI, else
   the only open view (not the MCP server's "active" view, which is separate state);
-- `bvs`: all open views; `binaryninja` / `bn`: the API module.
+- `bvs`: all views open in the UI.
 
 `print()` output is returned, and so is `result` if the script sets it (JSON, else `repr`).
-Scripts run one at a time on a worker thread; `--main-thread` runs on the UI thread (needed
-for UI objects; it blocks the UI while it runs); later scripts queue behind the running one.
-Exit status: 0 ok, 1 script error or cancelled, 2 bridge unreachable or refused, 3 Binary Ninja
-locked by someone else (see below), 130 interrupted with Ctrl-C.
+Exit status: 0 ok, 1 script error or cancelled, 2 bridge unreachable or refused (including the
+UI-view rules below), 3 Binary Ninja locked by someone else (see below), 130 interrupted with
+Ctrl-C.
+
+### UI views need the usage lock
+
+A UI tab is only usable while holding the usage lock: `bv` and `bvs` are provided only to a
+**serialized** script whose session (`--session`, default `$CLAUDE_CODE_SESSION_ID`) holds the
+lock. Otherwise:
+
+- `bv` and `bvs` are placeholders that raise `UIViewsUnavailable` (a `RuntimeError`) with the
+  reason on any use (attribute access, `len`, iteration, indexing, truth test); `repr` works.
+  They are not `None`/`[]` on purpose: an empty `bvs` would silently make a script do nothing.
+- `--view` and `--main-thread` are refused up front (exit 2, "take the usage lock first: bnrun
+  --lock --purpose ..."). If the lock is lost while the script waits in the queue, the script
+  is refused when it would start.
+
+Scripts that only create their own views through the API (`BinaryViewType[...].create(
+BinaryView.open(path))`, `BinaryView.open`, `binaryninja.load`, then `close()`) need no lock.
+
+**Limitation:** this is enforcement at the level of the script namespace, backed by
+convention. A script can still reach UI views by other paths (`binaryninjaui.UIContext`, ...);
+don't.
+
+### Two lanes: serialized (default) and `--parallel`
+
+- **Serialized** (default): one script at a time on a worker thread, later ones queue behind
+  it. `--main-thread` runs it on the UI thread instead (needed for UI objects; it blocks the UI
+  while it runs; needs the lock).
+- **`--parallel`** (`"parallel": true`): runs on its own worker thread without waiting for the
+  serialized lane, next to the serialized script and to other parallel ones, at most
+  `scriptbridge.maxParallel` (default 4, Settings, search "script bridge"; changes apply at once)
+  at a time; more wait for a slot. Binary Ninja's analysis is native and multithreaded, and
+  native calls release the GIL, so several `update_analysis_and_wait()` on separate views do run
+  concurrently. `--parallel` with `--main-thread` or `--view` is refused (exit 2); parallel
+  scripts get no `bv`/`bvs`, even for the lock holder (so a holder can't queue UI work behind
+  itself; its parallel scripts still run).
+
+**Rule of thumb:** UI views or shared state (the open tabs, the MCP active view, databases,
+global registrations) → serialized + usage lock. Only your own throwaway views → `--parallel`,
+no lock needed. Parallel scripts must not modify UI-opened views, switch the MCP active view or
+save databases; nothing but this convention stops a parallel script from doing so.
+
+The usage lock still applies to both lanes: while another session holds it, your scripts
+(parallel included) are refused with exit 3.
 
 ## Cancelling scripts
 
 ```sh
-bnrun --status                    # lock, plus "running script '<first line>' for 42s (session ...)"
+bnrun --status                    # lock, plus one "running script '<first line>' for 42s (...)"
+                                  # line per running script (", parallel" marks that lane) and
+                                  # "queued: N serialized, M parallel"; "no script running"
+                                  # only when both lanes are idle
 bnrun --timeout 60 script.py      # the bridge cancels the script after 60 s of running
-bnrun --cancel                    # cancel the running script (this session's, or as lock holder)
-bnrun --cancel --force            # cancel another session's script
+bnrun --cancel                    # cancel this session's running scripts (both lanes)
+bnrun --cancel --force            # cancel all running scripts (also other sessions')
 ```
 
 - **Ctrl-C** (or SIGTERM, e.g. a tool timeout killing `bnrun`) while `bnrun` waits cancels that
   script inside Binary Ninja too, then exits with 130. Each run carries a random run id, so this
   works without a session id and only ever hits its own script (also while still queued).
-- `--cancel` is allowed for the session that started the script (`--session`) or the usage-lock
-  holder; `--force` for anyone. Nothing running: exit 1 ("no script is running"); not allowed:
-  exit 3.
+- `--cancel` cancels the running scripts (serialized and parallel) of the calling session
+  (`--session`). If it has none, the usage-lock holder, or anyone with `--force`, cancels all
+  running scripts. Nothing running: exit 1 ("no script is running"); not allowed: exit 3. Each
+  script runs in its own thread, so a cancel or `--timeout` only hits the script it targets.
 - A cancelled script's reply has `"error": "cancelled"`, `"cancelled_by"` (session, lock holder,
   force, its client, or `timeout after Ns`) and the `print()` output captured so far.
 - How: the bridge raises `ScriptCancelled` (a `BaseException`, so a script's `except Exception`
@@ -68,16 +118,23 @@ bnrun --cancel --force            # cancel another session's script
   huge native call. A script that catches `BaseException` and carries on can't be cancelled.
   Whatever the script changed before the cancel stays changed (no rollback).
 
-Endpoints: `GET /run` (running script and queue length; `GET /lock` includes it too) and
-`POST /cancel {"session", "run_id", "force"}`; `POST /run` takes `"timeout"` (seconds) and
-`"run_id"`. Cancellation needs this plugin version loaded: restart Binary Ninja after updating.
+Endpoints: `GET /run` → `{"running": <serialized run or null>, "queued": N, "parallel":
+[<run>, ...], "parallel_queued": M, "max_parallel": K}` (`GET /lock` includes the same keys);
+each run status has `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `state`,
+`running_for`, `cancel_requested`. `POST /cancel {"session", "run_id", "force"}` answers
+`"cancelled"` (the first run hit, the serialized one if any) and `"cancelled_runs"` (all).
+`POST /run` takes `"timeout"` (seconds), `"run_id"` and `"parallel"`; it answers 400 for
+parallel + main_thread/view and 409 for view/main_thread without the lock. Cancellation needs
+this plugin version loaded: restart Binary Ninja after updating.
 
 ## Restarting Binary Ninja
 
     bnrestart [--force] [--save-new | --discard] [--no-reopen] [--wait SECONDS]
 
 Loads changed plugin code by restarting the app. Refuses (exit 3) while another session holds
-the usage lock or a script is running (`--force` overrides). Unsaved changes — note that analysis
+the usage lock or a script is running or queued in either lane (`--force` overrides). It takes
+the usage lock itself (as `$CLAUDE_CODE_SESSION_ID`, else `bnrestart-<pid>`) to list and save the
+open views, since only the lock holder sees them; the restart clears the lock. Unsaved changes — note that analysis
 alone marks a view modified:
 - views that already have a `.bndb` are saved into it;
 - other modified views make it refuse, unless `--save-new` (create `<file>.bndb` next to the
@@ -170,7 +227,8 @@ token file, as they could read your files anyway.
 ## Tests
 
 `python3 -m unittest discover -s tests -p 'test_*.py'` runs `tests/test_bridge.py` against `bridge_server.py` (bridge, lock, cancellation and timeouts including a fake main-thread
-runner, MCP proxy against a fake upstream), `bnrun` (including Ctrl-C/SIGTERM) and
+runner, the parallel lane and its slot limit, the UI-view rules, MCP proxy against a fake
+upstream), `bnrun` (including Ctrl-C/SIGTERM) and
 `mcp-session-header` with a fake namespace and a fake home directory. The plugin glue
 (`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's
 MCP server) only runs inside Binary Ninja and is not covered.

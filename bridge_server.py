@@ -1,22 +1,37 @@
 """Script bridge, usage lock and MCP proxy for Binary Ninja, free of Binary Ninja imports.
 
-The Binary Ninja plugin (__init__.py) supplies the script namespace (bv, bvs, binaryninja) and a
-main-thread runner; this module does the HTTP, the checks, the execution, the usage lock and the
+The Binary Ninja plugin (__init__.py) supplies the UI views (bv, bvs), the base namespace
+(binaryninja), the scriptbridge.maxParallel setting and a main-thread runner; this module does the HTTP, the checks, the execution, the usage lock and the
 MCP proxy, so it can be tested with a plain python3.
 
 Script bridge endpoints (bearer token + localhost checks, see ScriptBridge):
 
     GET  /ping     {"ok": true}
-    POST /run      {"code": str, "view": str?, "main_thread": bool?, "session": str?,
-                    "timeout": seconds?, "run_id": str?}
-                   -> {"ok", "stdout", "result", "error"}; 423 while locked by another session.
+    POST /run      {"code": str, "view": str?, "main_thread": bool?, "parallel": bool?,
+                    "session": str?, "timeout": seconds?, "run_id": str?}
+                   -> {"ok", "stdout", "result", "error"}; 423 while locked by another session;
+                   400 for parallel + main_thread / parallel + view; 409 for view or main_thread
+                   without holding the usage lock (see "UI views" below).
                    A cancelled script answers error "cancelled" (plus "cancelled_by") with the
                    stdout captured so far.
-    GET  /run      {"ok", "running": script status or null, "queued": int}
-    POST /cancel   {"session": str?, "run_id": str?, "force": bool?} cancel the running script
+    GET  /run      {"ok", "running": serialized script status or null, "queued": int,
+                    "parallel": [status, ...], "parallel_queued": int, "max_parallel": int}
+    POST /cancel   {"session": str?, "run_id": str?, "force": bool?} cancel running scripts
                    (or, with run_id, that run even if still queued); 409 if nothing to cancel,
                    403 if not allowed (see ScriptBridge.cancel)
-    GET  /lock     lock status (+ "running", as GET /run)
+    GET  /lock     lock status (+ the keys of GET /run)
+
+Two lanes: serialized scripts (the default) run one at a time behind run_mutex; parallel
+scripts ("parallel": true) don't take run_mutex and run concurrently with the serialized one
+and with each other, at most max_parallel at once (more wait for a slot). Each script runs in
+its own HTTP handler thread (or, with main_thread, on the main thread), so cancel/timeout target
+that thread only. Parallel is for scripts that only create, analyse and close their own views.
+
+UI views: the namespace's `bv`/`bvs` (the views open in the UI) are only provided to a
+serialized script whose session holds the usage lock. Otherwise they are NoUIViews placeholders
+that raise UIViewsUnavailable on use; "view" and "main_thread" are refused without the lock, and
+"view" is refused for parallel scripts. This is namespace-level enforcement backed by convention:
+a script can still reach UI views through binaryninjaui or other API paths.
     POST /lock     {"session": str, "name": str?, "purpose": str?, "ttl": seconds?}
                    take the lock, or renew it if this session already holds it
     POST /unlock   {"session": str?, "force": bool?} release it
@@ -59,13 +74,14 @@ import secrets
 import threading
 import time
 import traceback
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 MAX_BODY = 1 << 20
 DEFAULT_LOCK_TTL = 5 * 60
 MAX_LOCK_TTL = 4 * 60 * 60
 SESSION_HEADER = "X-BN-Session"
 SESSION_NAME_HEADER = "X-BN-Session-Name"
+DEFAULT_MAX_PARALLEL = 4
 
 # namespace_factory(view_filter) -> dict of globals for the script; raises LookupError when
 # the requested view isn't open.
@@ -89,6 +105,39 @@ def _jsonable(value: Any) -> Any:
 
 class ScriptCancelled(BaseException):
     """Raised inside a running script to cancel it (BaseException: `except Exception` misses it)."""
+
+
+class UIViewsUnavailable(RuntimeError):
+    """Raised when a script uses `bv`/`bvs` without being allowed UI views."""
+
+
+class NoUIViews:
+    """Stands in for `bv`/`bvs` when the script may not use UI views: any use raises."""
+
+    def __init__(self, name: str, reason: str):
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_reason", reason)
+
+    def _refuse(self, *_args, **_kwargs):
+        raise UIViewsUnavailable("`%s` is not available: %s" % (self._name, self._reason))
+
+    def __getattr__(self, attr):
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        self._refuse()
+
+    __setattr__ = __iter__ = __len__ = __getitem__ = __bool__ = __contains__ = __call__ = _refuse
+
+    def __repr__(self):
+        return "<no UI views: %s>" % self._reason
+
+
+NEED_LOCK = ("UI views (bv, bvs, --view, --main-thread) need the usage lock; take the usage "
+             "lock first: bnrun --lock --purpose '...' (scripts that only create their own "
+             "views with BinaryViewType[...].create / BinaryView.open / binaryninja.load need "
+             "no lock)")
+PARALLEL_NO_UI = ("parallel scripts get no UI views (bv, bvs, --view); UI work goes through "
+                  "the serialized lane: run without --parallel while holding the usage lock")
 
 
 _set_async_exc_fn = None
@@ -224,6 +273,12 @@ class UsageLock:
         self.listener(event, status)
         return True, status
 
+    def holds(self, session: Optional[str]) -> bool:
+        """True if `session` holds the lock right now (no renewal)."""
+        with self.mutex:
+            self._expire()
+            return self._is_holder(session)
+
     def check_use(self, session: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
         """(allowed, status): free, or used by the holder (which renews the lock)."""
         with self.mutex:
@@ -263,12 +318,14 @@ class Run:
     that was sent (see ScriptBridge._run_guarded)."""
 
     def __init__(self, code: str, session: Optional[str], name: str, main_thread: bool,
-                 timeout: Optional[float], run_id: str):
+                 timeout: Optional[float], run_id: str, parallel: bool = False):
         self.run_id = run_id
         self.session = session
         self.name = name
         self.label = _label(code)
         self.main_thread = main_thread
+        self.parallel = parallel
+        self.finished = False
         self.timeout = timeout
         self.queued_at = time.time()
         self.started: Optional[float] = None
@@ -282,7 +339,8 @@ class Run:
     def status(self) -> Dict[str, Any]:
         now = time.time()
         return {"session": self.session, "name": self.name, "label": self.label,
-                "main_thread": self.main_thread, "timeout": self.timeout,
+                "main_thread": self.main_thread, "parallel": self.parallel,
+                "timeout": self.timeout,
                 "state": "running" if self.started else "starting",
                 "running_for": int(now - self.started) if self.started else 0,
                 "cancel_requested": self.cancel_by}
@@ -293,6 +351,8 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         return "no script running"
     who = status.get("name") or (status.get("session") or "")[:8] or "no session"
     extra = [who]
+    if status.get("parallel"):
+        extra.append("parallel")
     if status.get("main_thread"):
         extra.append("main thread")
     if status.get("timeout"):
@@ -301,6 +361,17 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         extra.append("cancel requested: %s" % status["cancel_requested"])
     return "running script %r for %ds (%s)" % (status["label"], status["running_for"],
                                                ", ".join(extra))
+
+
+def describe_runs(reply: Dict[str, Any]) -> str:
+    """All running scripts of a GET /run (or /lock) reply, one per line; "no script running"
+    only when nothing runs or waits in either lane."""
+    runs = ([reply["running"]] if reply.get("running") else []) + list(reply.get("parallel") or [])
+    lines = [describe_run(r) for r in runs]
+    queued, pqueued = reply.get("queued") or 0, reply.get("parallel_queued") or 0
+    if queued or pqueued:
+        lines.append("queued: %d serialized, %d parallel" % (queued, pqueued))
+    return "\n".join(lines) or describe_run(None)
 
 
 def _localhost_only(handler: http.server.BaseHTTPRequestHandler) -> Optional[str]:
@@ -329,15 +400,25 @@ class ScriptBridge:
 
     def __init__(self, token: str, namespace_factory: NamespaceFactory,
                  main_thread_runner: Optional[MainThreadRunner] = None, port: int = 0,
-                 lock: Optional[UsageLock] = None):
+                 lock: Optional[UsageLock] = None,
+                 max_parallel: Union[int, Callable[[], int]] = DEFAULT_MAX_PARALLEL,
+                 base_namespace: Optional[Dict[str, Any]] = None):
+        """namespace_factory(view) gives the UI views (bv, bvs, ...) and is only called for
+        scripts allowed to use them; base_namespace (e.g. the binaryninja module) is what every
+        script gets. max_parallel: int, or a callable read whenever a parallel script waits."""
         self.token = token
         self.namespace_factory = namespace_factory
+        self.base_namespace = dict(base_namespace or {})
         self.main_thread_runner = main_thread_runner or (lambda fn: fn())
         self.lock = lock or UsageLock()
-        self.run_mutex = threading.Lock()    # one script at a time
-        self.state = threading.Lock()        # guards current, queued, cancelled_ids
-        self.current: Optional[Run] = None
-        self.queued = 0
+        self.max_parallel = max_parallel
+        self.run_mutex = threading.Lock()    # serialized lane: one script at a time
+        self.state = threading.Lock()        # guards current, queued, parallel*, cancelled_ids
+        self.slot_free = threading.Condition(self.state)   # a parallel slot or cancel happened
+        self.current: Optional[Run] = None   # the serialized run
+        self.queued = 0                      # serialized runs waiting for run_mutex
+        self.parallel_runs: List[Run] = []   # parallel runs holding a slot
+        self.parallel_queued = 0             # parallel runs waiting for a slot
         self.cancelled_ids: Dict[str, str] = {}   # run_id -> by, for runs not started yet
         bridge = self
 
@@ -378,11 +459,10 @@ class ScriptBridge:
                 if self.path == "/ping":
                     return _reply_json(self, 200, {"ok": True})
                 if self.path == "/lock":
-                    return _reply_json(self, 200, {"ok": True, "lock": bridge.lock.status(),
-                                                   "running": bridge.running()})
+                    return _reply_json(self, 200, dict(bridge.run_status(), ok=True,
+                                                       lock=bridge.lock.status()))
                 if self.path == "/run":
-                    return _reply_json(self, 200, {"ok": True, "running": bridge.running(),
-                                                   "queued": bridge.queued})
+                    return _reply_json(self, 200, dict(bridge.run_status(), ok=True))
                 _reply_json(self, 404, {"ok": False, "error": "not found"})
 
             def do_POST(self):
@@ -405,20 +485,30 @@ class ScriptBridge:
                 if not isinstance(code, str):
                     return _reply_json(self, 400, {"ok": False,
                                                    "error": "bad request: code must be a string"})
+                view, main_thread = req.get("view"), bool(req.get("main_thread"))
+                parallel = bool(req.get("parallel"))
+                if parallel and (main_thread or view):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: "
+                                                   + ("parallel scripts can't run on the main "
+                                                      "thread (--parallel with --main-thread)"
+                                                      if main_thread else PARALLEL_NO_UI)})
                 allowed, status = bridge.lock.check_use(req.get("session"))
                 if not allowed:
                     return _reply_json(self, 423, {"ok": False, "lock": status,
                                                    "error": "Binary Ninja is " + describe(status)})
+                if (view or main_thread) and not bridge.lock.holds(req.get("session")):
+                    return _reply_json(self, 409, {"ok": False, "lock": status,
+                                                   "error": NEED_LOCK})
                 timeout = req.get("timeout")
                 if timeout is not None and (isinstance(timeout, bool) or
                                             not isinstance(timeout, (int, float)) or timeout <= 0):
                     return _reply_json(self, 400, {"ok": False, "error": "bad request: timeout "
                                                    "must be a positive number of seconds"})
                 run_id = req.get("run_id")
-                reply = bridge.execute(code, req.get("view"), bool(req.get("main_thread")),
+                reply = bridge.execute(code, view, main_thread,
                                        session=req.get("session"), timeout=timeout,
                                        run_id=run_id if isinstance(run_id, str) else None,
-                                       name=str(req.get("name") or ""))
+                                       name=str(req.get("name") or ""), parallel=parallel)
                 try:
                     _reply_json(self, 200, reply)
                 except (BrokenPipeError, ConnectionResetError):
@@ -452,15 +542,39 @@ class ScriptBridge:
         self.port = self.httpd.server_address[1]
 
     def running(self) -> Optional[Dict[str, Any]]:
-        """Status of the script being run (see Run.status), or None when idle."""
+        """Status of the serialized script being run (see Run.status), or None when idle."""
         with self.state:
             return self.current.status() if self.current else None
 
+    def limit(self) -> int:
+        """Current maximum of parallel scripts (at least 1)."""
+        value = self.max_parallel() if callable(self.max_parallel) else self.max_parallel
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return DEFAULT_MAX_PARALLEL
+
+    def run_status(self) -> Dict[str, Any]:
+        """Both lanes: the GET /run reply without "ok"."""
+        with self.state:
+            return {"running": self.current.status() if self.current else None,
+                    "queued": self.queued,
+                    "parallel": [r.status() for r in self.parallel_runs],
+                    "parallel_queued": self.parallel_queued,
+                    "max_parallel": self.limit()}
+
     def execute(self, code: str, view: Optional[str], main_thread: bool,
                 session: Optional[str] = None, timeout: Optional[float] = None,
-                run_id: Optional[str] = None, name: str = "") -> Dict[str, Any]:
+                run_id: Optional[str] = None, name: str = "",
+                parallel: bool = False) -> Dict[str, Any]:
+        if parallel and main_thread:
+            return {"ok": False, "stdout": "", "result": None,
+                    "error": "parallel scripts can't run on the main thread"}
         run = Run(code, session if isinstance(session, str) else None, name, main_thread,
-                  float(timeout) if timeout else None, run_id or secrets.token_hex(16))
+                  float(timeout) if timeout else None, run_id or secrets.token_hex(16),
+                  parallel)
+        if parallel:
+            return self._execute_parallel(run, code, view)
         with self.state:
             self.queued += 1
         waiting = True
@@ -473,30 +587,73 @@ class ScriptBridge:
                     if run.run_id in self.cancelled_ids:
                         run.cancel_by = self.cancelled_ids.pop(run.run_id)
                 try:
-                    if run.cancel_by is not None:
-                        return self._cancelled(run, "")
-                    try:
-                        namespace = self.namespace_factory(view)
-                    except LookupError as e:
-                        return {"ok": False, "stdout": "", "result": None, "error": str(e)}
-                    box: Dict[str, Any] = {}
-
-                    def job():
-                        box.update(self._run_guarded(run, code, namespace))
-                    if main_thread:
-                        self.main_thread_runner(job)
-                    else:
-                        job()
-                    return box or self._cancelled(run, "")
+                    return self._execute_run(run, code, view)
                 finally:
                     if run.timer is not None:
                         run.timer.cancel()
                     with self.state:
                         self.current = None
+                        run.finished = True
         finally:
             if waiting:
                 with self.state:
                     self.queued -= 1
+
+    def _execute_parallel(self, run: Run, code: str, view: Optional[str]) -> Dict[str, Any]:
+        with self.state:
+            self.parallel_queued += 1
+            try:
+                while (len(self.parallel_runs) >= self.limit()
+                       and run.run_id not in self.cancelled_ids):
+                    self.slot_free.wait(0.5)    # also picks up a changed limit
+            finally:
+                self.parallel_queued -= 1
+            if run.run_id in self.cancelled_ids:
+                run.cancel_by = self.cancelled_ids.pop(run.run_id)
+                run.finished = True
+                return self._cancelled(run, "")
+            self.parallel_runs.append(run)
+        try:
+            return self._execute_run(run, code, view)
+        finally:
+            if run.timer is not None:
+                run.timer.cancel()
+            with self.state:
+                self.parallel_runs.remove(run)
+                run.finished = True
+                self.slot_free.notify_all()
+
+    def _namespace(self, run: Run, view: Optional[str]) -> Dict[str, Any]:
+        """The script's globals: the UI views only for a serialized lock holder.
+        Raises LookupError (bad view filter) or UIViewsUnavailable (view not allowed)."""
+        if run.parallel:
+            reason = PARALLEL_NO_UI
+        elif not self.lock.holds(run.session):
+            reason = NEED_LOCK
+        else:
+            return dict(self.base_namespace, **self.namespace_factory(view))
+        if view or run.main_thread:     # re-checked here: the lock may have gone while queued
+            raise UIViewsUnavailable(reason)
+        return dict(self.base_namespace, bv=NoUIViews("bv", reason),
+                    bvs=NoUIViews("bvs", reason))
+
+    def _execute_run(self, run: Run, code: str, view: Optional[str]) -> Dict[str, Any]:
+        """Run a script that holds its lane (run_mutex or a parallel slot)."""
+        if run.cancel_by is not None:
+            return self._cancelled(run, "")
+        try:
+            namespace = self._namespace(run, view)
+        except (LookupError, UIViewsUnavailable) as e:
+            return {"ok": False, "stdout": "", "result": None, "error": str(e)}
+        box: Dict[str, Any] = {}
+
+        def job():
+            box.update(self._run_guarded(run, code, namespace))
+        if run.main_thread:
+            self.main_thread_runner(job)
+        else:
+            job()
+        return box or self._cancelled(run, "")
 
     @staticmethod
     def _cancelled(run: Run, stdout: str) -> Dict[str, Any]:
@@ -549,54 +706,65 @@ class ScriptBridge:
 
     def _on_timeout(self, run: Run) -> None:
         with self.state:
-            if self.current is run and run.cancel_by is None:
+            if not run.finished and run.cancel_by is None:
                 run.cancel_by = "timeout after %gs" % run.timeout
                 self._interrupt(run)
 
     def cancel(self, session: Optional[str] = None, run_id: Optional[str] = None,
                force: bool = False) -> Tuple[int, Dict[str, Any]]:
-        """Cancel the running script: (HTTP status, reply).
+        """Cancel running scripts: (HTTP status, reply).
 
-        Allowed for the session that started it, the usage-lock holder, whoever names its
-        run_id (only the client that sent /run knows it), or anyone with force. A run_id that
-        isn't running yet (queued, or not arrived) is remembered and won't start."""
+        With run_id (only the client that sent /run knows it): exactly that run; one that isn't
+        running yet (queued, or not arrived) is remembered and won't start. Without: the
+        caller's own running scripts (serialized and parallel) if it has any; otherwise, for
+        the usage-lock holder or with force, every running script. The reply's "cancelled" is
+        the first cancelled run (the serialized one if hit), "cancelled_runs" all of them."""
         session = session if isinstance(session, str) and session else None
         run_id = run_id if isinstance(run_id, str) and run_id else None
         holder = self.lock.status().get("session")
-        with self.state:
-            run = self.current
-            if run_id and (run is None or not hmac.compare_digest(run_id.encode(),
-                                                                  run.run_id.encode())):
-                self.cancelled_ids[run_id] = "its client"
-                while len(self.cancelled_ids) > 100:
-                    self.cancelled_ids.pop(next(iter(self.cancelled_ids)))
-                return 200, {"ok": True, "cancelled": None, "pending": True}
-            if run is None:
-                return 409, {"ok": False, "running": None, "error": "no script is running"}
 
-            def same(a, b):
-                return a is not None and b is not None and hmac.compare_digest(a.encode(),
-                                                                               b.encode())
+        def same(a, b):
+            return a is not None and b is not None and hmac.compare_digest(a.encode(),
+                                                                           b.encode())
+        with self.state:
+            active = ([self.current] if self.current else []) + list(self.parallel_runs)
             if run_id:
+                targets = [r for r in active if same(run_id, r.run_id)]
+                if not targets:
+                    self.cancelled_ids[run_id] = "its client"
+                    while len(self.cancelled_ids) > 100:
+                        self.cancelled_ids.pop(next(iter(self.cancelled_ids)))
+                    self.slot_free.notify_all()     # a queued parallel run stops waiting
+                    return 200, {"ok": True, "cancelled": None, "pending": True}
                 by = "its client"
-            elif same(session, run.session):
-                by = "session %s" % session
-            elif same(session, holder):
-                by = "lock holder %s" % session
-            elif force:
-                by = "force by %s" % (session or "unknown session")
+            elif not active:
+                return 409, {"ok": False, "running": None, "error": "no script is running"}
             else:
-                return 403, {"ok": False, "running": run.status(),
-                             "error": "not allowed: the running script belongs to %s; you need "
-                                      "to be that session or the lock holder, or use force"
-                                      % (run.name or run.session or "no session")}
-            if run.cancel_by is None:
-                run.cancel_by = by
-            try:
-                self._interrupt(run)
-            except RuntimeError as e:
-                return 500, {"ok": False, "running": run.status(), "error": str(e)}
-            return 200, {"ok": True, "cancelled": run.status()}
+                targets = [r for r in active if same(session, r.session)]
+                if targets:
+                    by = "session %s" % session
+                elif same(session, holder):
+                    targets, by = active, "lock holder %s" % session
+                elif force:
+                    targets, by = active, "force by %s" % (session or "unknown session")
+                else:
+                    owners = sorted({r.name or r.session or "no session" for r in active})
+                    return 403, {"ok": False, "running": active[0].status(),
+                                 "error": "not allowed: the running script%s belong%s to %s; "
+                                          "you need to be that session or the lock holder, "
+                                          "or use force" % (
+                                              "s" if len(active) > 1 else "",
+                                              "" if len(active) > 1 else "s",
+                                              ", ".join(owners))}
+            for run in targets:
+                if run.cancel_by is None:
+                    run.cancel_by = by
+                try:
+                    self._interrupt(run)
+                except RuntimeError as e:
+                    return 500, {"ok": False, "running": run.status(), "error": str(e)}
+            return 200, {"ok": True, "cancelled": targets[0].status(),
+                         "cancelled_runs": [r.status() for r in targets]}
 
     def start(self) -> None:
         threading.Thread(target=self.httpd.serve_forever, name="bn-script-bridge",
