@@ -1,5 +1,5 @@
 ---
-name: binaryninja-mcp
+name: binaryninja-bridge
 description: Use whenever analysing a binary (ELF, Mach-O, PE, firmware, app frameworks) in the running Binary Ninja app -- selecting the right view, listing symbols/functions/strings, reading disassembly/decompilation/IL, tracing callers/xrefs, and annotating findings (comments, renames, types). All of it runs through the `bnrun` script bridge (the full Binary Ninja Python API inside the running app); there are no `bn_*` MCP tools any more. Trigger for "load this into Binary Ninja", "look at this binary in BN", "what does function X do", "which API does this app call", "find where this string is used" -- not only when Binary Ninja is named. Covers bnrun mechanics, the shared usage lock across sessions, and the Personal-licence constraints; which binaries a project analyses and where findings go are in that project's CLAUDE.md and a `project-notes.md` next to this file if present.
 ---
 

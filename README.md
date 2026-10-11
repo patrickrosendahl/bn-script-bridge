@@ -1,15 +1,15 @@
 # bn-script-bridge
 
 Run Python scripts inside the running Binary Ninja app from the command line. The Personal
-licence refuses the API outside the app (`binaryninja.load()` from a plain `python3` fails with
-"License is not valid"), and the Binary Ninja MCP server only offers a fixed tool set. This
-plugin listens on 127.0.0.1 and runs the scripts that `bnrun` sends, with the full Python API.
-It also keeps a usage lock so several sessions can share one Binary Ninja, and puts a
-lock-aware proxy in front of Binary Ninja's MCP server.
+licence refuses the API outside the app (`binaryninja.load()` from a plain `python3` fails
+with "License is not valid"). This plugin listens on 127.0.0.1 and runs the scripts that
+`bnrun` sends, with the full Python API. It also keeps a usage lock so several sessions can
+share one Binary Ninja, and optionally puts a lock-aware proxy in front of Binary Ninja's
+own MCP server for MCP clients (see [MCP proxy](#mcp-proxy)).
 
 Contents: `__init__.py` (plugin glue), `bridge_server.py` (bridge, lock, MCP proxy), `bnrun`
 (run scripts, manage the lock), `bnrestart` (restart Binary Ninja), `mcp-session-header`
-(Claude Code `headersHelper`), `skills/binaryninja-mcp` (Claude Code skill).
+(`headersHelper` for MCP clients), `skills/binaryninja-bridge` (Claude Code skill).
 
 ## Install
 
@@ -21,16 +21,15 @@ Then restart Binary Ninja. Plugins load only at startup; if several sessions sha
 instance, coordinate the restart (see [Restarting Binary Ninja](#restarting-binary-ninja)).
 `bnrun` and `bnrestart` can be run from here or symlinked onto `PATH`.
 
-For Claude Code, point the MCP server at the proxy (local scope shown; `-s user` for all
-projects) and install the skill:
+For Claude Code, install the skill (user scope shown; drop it into a project's
+`.claude/skills/` instead for a single project):
 
 ```sh
-claude mcp remove binaryninja -s local
-claude mcp add-json -s local binaryninja '{"type": "http", "url": "http://127.0.0.1:24643/mcp",
-  "headersHelper": "/Users/patrick/dev/bn-script-bridge/mcp-session-header"}'
-
-ln -s /Users/patrick/dev/bn-script-bridge/skills/binaryninja-mcp ~/.claude/skills/binaryninja-mcp
+ln -s /Users/patrick/dev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
 ```
+
+The skill needs no MCP registration -- everything runs through `bnrun`. Pointing an MCP
+client at the proxy is optional and covered in [MCP proxy](#mcp-proxy).
 
 ## Use
 
@@ -181,7 +180,18 @@ Dock → right-click Binary Ninja → Options → Assign To → This Desktop.
 ## MCP proxy
 
 The plugin runs a lock-aware MCP proxy on 127.0.0.1:24643 (`scriptbridge.mcpProxyPort`) in
-front of Binary Ninja's own MCP server; MCP clients connect to the proxy. The proxy:
+front of Binary Ninja's own MCP server; MCP clients connect to the proxy. This is optional:
+the Claude Code skill does not use it (no `bn_*` MCP tools exist any more -- everything goes
+through `bnrun`); it exists for other MCP clients. To point Claude Code at it (local scope
+shown; `-s user` for all projects):
+
+```sh
+claude mcp remove binaryninja -s local
+claude mcp add-json -s local binaryninja '{"type": "http", "url": "http://127.0.0.1:24643/mcp",
+  "headersHelper": "/Users/patrick/dev/bn-script-bridge/mcp-session-header"}'
+```
+
+The proxy:
 
 - forwards everything to Binary Ninja's MCP server (replies and streams unchanged);
 - adds two tools to `tools/list`, answered by the proxy and never blocked:
@@ -206,7 +216,7 @@ running (bridge stopped), MCP calls fail to connect: start the bridge.
 
 The caller's identity is the `X-BN-Session` header, else the `MCP-Session-Id` that Binary
 Ninja assigned to the connection. Claude Code sends the header through the `headersHelper`
-`mcp-session-header` (see [Install](#install)), so a session's MCP calls and its `bnrun`
+`mcp-session-header` (see [MCP proxy](#mcp-proxy)), so a session's MCP calls and its `bnrun`
 scripts count as the same holder. The helper runs on every connect and reconnect, so changing
 the lock never needs a restart.
 
