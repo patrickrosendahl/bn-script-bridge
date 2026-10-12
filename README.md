@@ -16,7 +16,7 @@ Code skill).
 ## Install
 
 ```sh
-ln -s /Users/patrick/rev/bn-script-bridge ~/Library/Application\ Support/Binary\ Ninja/plugins/bn-script-bridge
+ln -s /Users/patrick/dev/bn-script-bridge ~/Library/Application\ Support/Binary\ Ninja/plugins/bn-script-bridge
 ```
 
 Then restart Binary Ninja. Plugins load only at startup; if several sessions share the
@@ -27,7 +27,7 @@ For Claude Code, install the skill (user scope shown; drop it into a project's
 `.claude/skills/` instead for a single project):
 
 ```sh
-ln -s /Users/patrick/rev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
+ln -s /Users/patrick/dev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
 ```
 
 The skill needs no MCP registration -- everything runs through `bnrun`. Pointing an MCP
@@ -291,7 +291,7 @@ To point Claude Code at it (local scope shown; `-s user` for all projects):
 ```sh
 claude mcp remove binaryninja -s local
 claude mcp add-json -s local binaryninja '{"type": "http", "url": "http://127.0.0.1:24643/mcp",
-  "headersHelper": "/Users/patrick/rev/bn-script-bridge/mcp-session-header"}'
+  "headersHelper": "/Users/patrick/dev/bn-script-bridge/mcp-session-header"}'
 ```
 
 The proxy:

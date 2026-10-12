@@ -9,7 +9,7 @@ symlinking the directory into Claude Code's user-level skills folder, so edits h
 effect without copying:
 
 ```sh
-ln -s /Users/patrick/rev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
+ln -s /Users/patrick/dev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
 ```
 
 - Link the **directory** (not `SKILL.md`); Claude Code expects `~/.claude/skills/<name>/SKILL.md`,

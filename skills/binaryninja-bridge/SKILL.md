@@ -5,7 +5,7 @@ description: Use whenever analysing a binary (ELF, Mach-O, PE, .class, firmware)
 
 # Binary Ninja via the `bnrun` script bridge
 
-`BNRUN=/Users/patrick/rev/bn-script-bridge/bnrun` (not on PATH; `bnrestart` beside it; setup notes in that repo's README) runs a Python script **inside the running Binary Ninja app** (Personal licence: no headless API) and returns its output. One script batches many tool calls.
+`BNRUN=/Users/patrick/dev/bn-script-bridge/bnrun` (not on PATH; `bnrestart` beside it; setup notes in that repo's README) runs a Python script **inside the running Binary Ninja app** (Personal licence: no headless API) and returns its output. One script batches many tool calls.
 
 ```sh
 $BNRUN --status                                # free / locked by <session>: <purpose>
@@ -34,12 +34,12 @@ $BNRUN --unlock
 - Locked by another session → don't use BN; message them via `SendMessage`. Stale lock: `--unlock --force` or `--cancel --force` only after asking.
 - `--timeout N` on every long run (cancellation lands only between bytecodes).
 
-## Bundled scripts (`/Users/patrick/rev/bn-script-bridge/scripts/`) -- use these, don't rewrite them
+## Bundled scripts (`/Users/patrick/dev/bn-script-bridge/scripts/`) -- use these, don't rewrite them
 ```sh
 $BNRUN --bndb $DB annotate -- R:0x401000:parse_header D:0x405000:cfg_table "C:0x401020:token refresh race"
 $BNRUN --bndb $DB info -- F:0x401000 S:maxFunctionSize    # function + analysis-skip state; settings
 $BNRUN --bndb $DB decompile -- 0x401000 > /tmp/f.hlil     # un-skips huge functions, prints full HLIL
-BNANNOTATE=/Users/patrick/rev/bn-script-bridge/bnannotate
+BNANNOTATE=/Users/patrick/dev/bn-script-bridge/bnannotate
 $BNANNOTATE --bndb $DB --save R:0x401000:parse_header "C:0x401020:..."   # annotate + --bndb-save
 ```
 `annotate`: `R:` renames the function **starting** at ADDR, `D:` a data symbol, `C:` sets a comment (replaces it; the old text is printed). All directives are validated first: one bad → nothing applied, exit 1. Works on `--view` too (with the lock). `bnannotate`: directive-shaped args go to annotate, the rest to bnrun; `--save` only after a successful batch.
