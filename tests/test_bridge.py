@@ -1,5 +1,6 @@
 """Host tests for the script bridge: bridge_server.py and the bnrun client, without Binary Ninja."""
 
+import enum
 import http.client
 import http.server
 import json
@@ -20,6 +21,7 @@ sys.path.insert(0, ROOT)
 import bridge_server  # noqa: E402
 
 BNRUN = os.path.join(ROOT, "bnrun")
+BNANNOTATE = os.path.join(ROOT, "bnannotate")
 
 
 class FakeView:
@@ -1034,6 +1036,239 @@ class BndbCacheTest(BridgeFixture):
         self.assertEqual(r.returncode, 2)
         r = self.bnrun("--bndb", os.path.join(self.tmp.name, "missing.bndb"), "-e", "pass")
         self.assertEqual(r.returncode, 2)
+
+
+class RunScriptExitTest(unittest.TestCase):
+    """sys.exit() in a script: a status or message, never a traceback."""
+
+    def test_exit_codes(self):
+        run = bridge_server.run_script
+        self.assertEqual(run("import sys\nresult = 1\nsys.exit()", {})["result"], 1)
+        self.assertTrue(run("import sys\nsys.exit(0)", {})["ok"])
+        reply = run("import sys\nprint('x')\nsys.exit('bad batch')", {})
+        self.assertEqual((reply["ok"], reply["stdout"], reply["error"]),
+                         (False, "x\n", "bad batch\n"))
+        reply = run("raise SystemExit(3)", {})
+        self.assertEqual((reply["ok"], reply["error"]), (False, "script exited with status 3\n"))
+
+
+class FakeSymbol:
+    def __init__(self, type, address, name):
+        self.type, self.address, self.name = type, address, name
+
+
+class FakeSettings:
+    VALUES = {"analysis.limits.maxFunctionSize": 65536, "analysis.mode": "full",
+              "ui.theme": "dark"}
+
+    def keys(self):
+        return list(self.VALUES)
+
+    def get_json(self, key):
+        return json.dumps(self.VALUES[key])
+
+
+FAKE_BN = type(sys)("binaryninja")
+FAKE_BN.Symbol = FakeSymbol
+FAKE_BN.SymbolType = type("SymbolType", (), {"FunctionSymbol": "Function", "DataSymbol": "Data"})
+FAKE_BN.Settings = FakeSettings
+
+
+# An IntEnum like Binary Ninja's AnalysisSkipReason: str() of one is just the number.
+SkipReason = enum.IntEnum("AnalysisSkipReason", [("NoSkipReason", 0), ("ExceedFunctionSize", 2)])
+
+
+class FakeFunction:
+    def __init__(self, view, name, start, end, skipped=False):
+        self.view, self.name, self.start, self.highest_address = view, name, start, end
+        self.analysis_skipped = skipped
+        self.analysis_skip_reason = SkipReason.ExceedFunctionSize if skipped else \
+            SkipReason.NoSkipReason
+        self.comments = {}
+
+    def get_comment_at(self, addr):
+        return self.comments.get(addr, "")
+
+    def set_comment_at(self, addr, text):
+        self.comments[addr] = text
+
+    @property
+    def hlil(self):
+        return "stub" if self.analysis_skipped else "int32_t %s()\n{\n    return 0;\n}" % self.name
+
+
+class FakeBinaryView:
+    """Just enough BinaryView for the bundled scripts: functions at 0x1000 and 0x2000, valid
+    addresses 0x1000..0x10000."""
+
+    def __init__(self, path):
+        self.path = path
+        self.saved = 0
+        self.functions = {0x1000: FakeFunction(self, "sub_1000", 0x1000, 0x10ff),
+                          0x2000: FakeFunction(self, "sub_2000", 0x2000, 0x8fff, skipped=True)}
+        self.symbols = {}
+        self.comments = {}
+        self.unskip_requested = False
+
+    def get_function_at(self, addr):
+        return self.functions.get(addr)
+
+    def get_functions_containing(self, addr):
+        return [f for f in self.functions.values() if f.start <= addr <= f.highest_address]
+
+    def is_valid_offset(self, addr):
+        return 0x1000 <= addr < 0x10000
+
+    def define_user_symbol(self, sym):
+        self.symbols[sym.address] = sym
+        if sym.type == "Function":
+            self.functions[sym.address].name = sym.name
+
+    def get_symbol_at(self, addr):
+        return self.symbols.get(addr)
+
+    def get_comment_at(self, addr):
+        return self.comments.get(addr, "")
+
+    def set_comment_at(self, addr, text):
+        self.comments[addr] = text
+
+    def update_analysis_and_wait(self):
+        pass        # the fake's HLIL only depends on analysis_skipped
+
+
+class BundledScriptsTest(BridgeFixture):
+    """scripts/ (annotate, info, decompile) run by bare name, and the bnannotate wrapper."""
+
+    def setUp(self):
+        super().setUp()
+        saved = sys.modules.get("binaryninja")
+        sys.modules["binaryninja"] = FAKE_BN     # the scripts `import binaryninja as bn`
+        self.addCleanup(lambda: sys.modules.pop("binaryninja") if saved is None
+                        else sys.modules.__setitem__("binaryninja", saved))
+        self.opened = []
+
+        def open_view(path):
+            self.opened.append(path)
+            return FakeBinaryView(path)
+
+        def save_view(v):
+            v.saved += 1
+            return True
+
+        self.bridge.bndb_open = open_view
+        self.bridge.bndb_save = save_view
+        self.bridge.bndb_close = lambda v: None
+        # realpath: macOS /var is a symlink, and bnrun's abspath of a relative path sees the cwd
+        self.db = os.path.join(os.path.realpath(self.tmp.name), "target.bndb")
+        with open(self.db, "w") as f:
+            f.write("x")
+
+    def view(self):
+        return self.bridge.bndb_views[self.db]
+
+    def run_tool(self, *args, tool=BNRUN, cwd=None):
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config)
+        return subprocess.run([sys.executable, tool, *args], capture_output=True, text=True,
+                              env=env, timeout=30, cwd=cwd)
+
+    def test_annotate_applies_renames_and_comments(self):
+        r = self.run_tool("--bndb", self.db, "annotate", "--", "R:0x1000:parse_header",
+                          "D:3000:voice_table", "C:0x1010:checks the magic",
+                          "C:0x9500:a data comment")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [
+            "R 0x1000 sub_1000 -> parse_header", "D 0x3000 (none) -> voice_table",
+            "C 0x1010 comment set", "C 0x9500 comment set"])
+        v = self.view()
+        self.assertEqual(v.functions[0x1000].name, "parse_header")
+        self.assertEqual(v.symbols[0x3000].name, "voice_table")
+        self.assertEqual(v.functions[0x1000].comments, {0x1010: "checks the magic"})
+        self.assertEqual(v.comments, {0x9500: "a data comment"})
+        r = self.run_tool("--bndb", self.db, "annotate", "--", "C:0x1010:new: with colon")
+        self.assertEqual(r.stdout, "C 0x1010 comment set (was: checks the magic)\n")
+        self.assertEqual(v.functions[0x1000].comments[0x1010], "new: with colon")
+
+    def test_annotate_bad_directive_applies_nothing(self):
+        r = self.run_tool("--bndb", self.db, "annotate", "--", "R:0x1000:ok_name",
+                          "R:0x1004:inside_not_start", "R:0x1000", "C:zz:x", "D:0x99:low",
+                          "X:1:2")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stderr, "annotate: nothing applied (5 bad directives)\n")
+        self.assertEqual(len(r.stdout.splitlines()), 5)
+        self.assertIn("no function starts at 0x1004", r.stdout)
+        self.assertIn("bad address 'zz'", r.stdout)
+        self.assertEqual(self.view().functions[0x1000].name, "sub_1000")
+        r = self.run_tool("--bndb", self.db, "annotate")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("annotate: no directives", r.stderr)
+
+    def test_info(self):
+        r = self.run_tool("--bndb", self.db, "info", "--", "F:0x2000", "F:0x1004", "F:0x9999",
+                          "S:ANALYSIS")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [
+            "F:0x2000 sub_2000 @ 0x2000..0x8fff skipped=True reason=ExceedFunctionSize",
+            "F:0x1004 sub_1000 @ 0x1000..0x10ff skipped=False reason=NoSkipReason",
+            "F:0x9999 no function at 0x9999",
+            "S:ANALYSIS analysis.limits.maxFunctionSize = 65536",
+            'S:ANALYSIS analysis.mode = "full"'])
+        r = self.run_tool("--bndb", self.db, "info", "--", "F:nope", "Q")
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stderr, "info: 2 bad queries\n")
+
+    def test_decompile_unskips(self):
+        r = self.run_tool("--bndb", self.db, "decompile", "--", "0x2000")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "int32_t sub_2000()\n{\n    return 0;\n}\n")
+        self.assertFalse(self.view().functions[0x2000].analysis_skipped)
+        r = self.run_tool("--bndb", self.db, "decompile", "--", "0x1000", "rel.hlil")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("OUT must be an absolute path", r.stderr)
+        out = os.path.join(self.tmp.name, "f.hlil")
+        r = self.run_tool("--bndb", self.db, "decompile", "--", "0x1000", out)
+        self.assertEqual(r.stdout, "sub_1000: wrote %s (4 lines)\n" % out)
+        with open(out) as f:
+            self.assertTrue(f.read().startswith("int32_t sub_1000()"))
+        r = self.run_tool("--bndb", self.db, "decompile", "--", "0x1004")
+        self.assertEqual((r.returncode, r.stderr),
+                         (1, "decompile: no function starts at 0x1004\n"))
+
+    def test_script_lookup_and_relative_bndb(self):
+        # Not ending in .py: the bundled library, even with a same-named file here (also with
+        # a slash); ending in .py: a file.
+        with open(os.path.join(self.tmp.name, "info"), "w") as f:
+            f.write("result = 'local file'")
+        with open(os.path.join(self.tmp.name, "info.py"), "w") as f:
+            f.write("result = 'local file'")
+        r = self.run_tool("--bndb", "target.bndb", "info", "--", "S:analysis.mode",
+                          cwd=self.tmp.name)
+        self.assertEqual(r.stdout, 'S:analysis.mode analysis.mode = "full"\n')
+        self.assertEqual(self.opened, [self.db])     # sent as an absolute path
+        r = self.run_tool("--bndb", "target.bndb", "info.py", cwd=self.tmp.name)
+        self.assertEqual(r.stdout, "local file\n")
+        r = self.run_tool("--bndb", "target.bndb", "./info", cwd=self.tmp.name)
+        self.assertEqual(r.returncode, 2)
+        r = self.run_tool("--bndb", self.db, "nosuch")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no bundled script 'nosuch' (bundled: annotate, decompile, info); "
+                      "a file must end in .py", r.stderr)
+        r = self.run_tool("--bndb-save", "target.bndb", cwd=self.tmp.name)
+        self.assertEqual((r.returncode, self.view().saved), (0, 1))
+
+    def test_bnannotate(self):
+        r = self.run_tool("--bndb", self.db, "R:0x1000:parse_header", "--save",
+                          "--", "C:0x1010:x", tool=BNANNOTATE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), ["R 0x1000 sub_1000 -> parse_header",
+                                                 "C 0x1010 comment set", "saved " + self.db])
+        self.assertEqual(self.view().saved, 1)
+        r = self.run_tool("--bndb", self.db, "R:0x1004:bad", "--save", tool=BNANNOTATE)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.view().saved, 1)      # failed edits: no save
+        r = self.run_tool("R:0x1000:x", "--save", tool=BNANNOTATE)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--save needs --bndb", r.stderr)
 
 
 class UIViewRulesTest(BridgeFixture):

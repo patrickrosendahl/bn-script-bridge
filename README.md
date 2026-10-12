@@ -8,8 +8,10 @@ share one Binary Ninja, and optionally puts a lock-aware proxy in front of Binar
 own MCP server for MCP clients (see [MCP proxy](#mcp-proxy)).
 
 Contents: `__init__.py` (plugin glue), `bridge_server.py` (bridge, lock, MCP proxy), `bnrun`
-(run scripts, manage the lock), `bnrestart` (restart Binary Ninja), `mcp-session-header`
-(`headersHelper` for MCP clients), `skills/binaryninja-bridge` (Claude Code skill).
+(run scripts, manage the lock), `scripts/` (bundled scripts: annotate, info, decompile),
+`bnannotate` (shorthand for renames and comments), `bnrestart` (restart Binary Ninja),
+`mcp-session-header` (`headersHelper` for MCP clients), `skills/binaryninja-bridge` (Claude
+Code skill).
 
 ## Install
 
@@ -47,7 +49,7 @@ echo 'result = [f.name for f in bv.functions][:10]' | bnrun
 bnrun --unlock
 
 bnrun --parallel --timeout 600 check.py           # own throwaway views, no lock
-bnrun --bndb synthv-studio.x86_64.bndb dump.py -- out.hlil   # cached headless view, no lock
+bnrun --bndb synthv-studio.x86_64.bndb dump.py -- 0x401000   # cached headless view, no lock
 ```
 
 The script sees:
@@ -61,6 +63,9 @@ The script sees:
   [Arguments and environment](#arguments-and-environment)).
 
 `print()` output is returned, and so is `result` if the script sets it (JSON, else `repr`).
+
+SCRIPT ending in `.py` is a file (`check.py`, `/abs/check.py`); anything else names a
+[bundled script](#bundled-scripts) (`annotate`). No SCRIPT (or `-`) reads stdin.
 
 Exit status: 0 ok, 1 script error or cancelled, 2 bridge unreachable or refused (including
 the UI-view rules below), 3 Binary Ninja locked by another session, 130 interrupted with
@@ -162,6 +167,9 @@ bnrun --bndb-save                                 # write renames etc. back into
 bnrun --bndb-close                                # free the memory (tens of MB per view)
 ```
 
+`bnrun` sends the `--bndb` path (and a `--bndb-save`/`--bndb-close` PATH) as an absolute
+path, so relative paths mean the current directory, not Binary Ninja's.
+
 Rules: `--bndb` runs in the serialized lane (cached views are shared, so runs using them must
 not overlap) but needs **no usage lock** — it touches no UI view — and can't be combined with
 `--view`, `--main-thread` or `--parallel`. `bvs` stays a placeholder that raises with the
@@ -173,6 +181,47 @@ Management is refused (409) while a serialized script runs; `--bndb-save` of a r
 writes a whole `.bndb` (300 s timeout). **Stop** (or quitting Binary Ninja) closes the cache
 without saving; `bnrestart` saves it first. Note the `nargs` trap: `bnrun --bndb-save foo.py`
 takes `foo.py` as the PATH — management commands take no script.
+
+## Bundled scripts
+
+`scripts/` holds scripts that every project needs. `bnrun` runs them by name: a SCRIPT not
+ending in `.py` is looked up here; one ending in `.py` is a file. Each documents its
+arguments at the top.
+
+```sh
+DB=/abs/path/synthv-studio.x86_64.bndb
+bnrun --bndb $DB annotate -- R:0x10014fed0:nhv_proc D:0x1002a0000:voice_table \
+                             "C:0x10014fed0:called once per voice"
+bnrun --bndb-save $DB                                   # the edits live in RAM until saved
+bnrun --bndb $DB info -- F:0x10014fed0 S:maxFunctionSize  # function info, settings
+bnrun --bndb $DB decompile -- 0x10014fed0 > nhv_proc.hlil # un-skip if needed, print HLIL
+```
+
+- **annotate**: `R:ADDR:NAME` renames the function starting at ADDR, `D:ADDR:NAME` defines or
+  renames the data symbol at ADDR, `C:ADDR:TEXT` sets the comment at ADDR (a function comment
+  inside a function, a view comment elsewhere; it replaces the old one, which is printed).
+  ADDR is hex, `0x` optional; TEXT may contain `:`. Every directive is checked first (syntax,
+  a function starting at ADDR for `R:`, a valid address otherwise); if one is bad, nothing is
+  applied and the run exits 1.
+- **info**: read-only. `F:ADDR` shows the function at (or containing) ADDR with its analysis
+  skip state, `S:SUBSTR` lists the settings whose id contains SUBSTR with their values.
+- **decompile** `ADDR [OUT]`: Binary Ninja skips huge functions (`ExceedFunctionSize`, ...)
+  and their HLIL is a stub; this clears the skip, waits for analysis and prints the HLIL, or
+  writes it to OUT. OUT must be absolute: scripts run inside Binary Ninja, whose working
+  directory isn't yours. Redirecting stdout avoids that.
+
+The scripts work on any view, not only `--bndb` (`--view` with the usage lock, too). For
+annotations, `bnannotate` saves typing: arguments shaped like `R:`/`D:`/`C:` (and everything
+after `--`) are directives, all others go to `bnrun`; `--save` runs `bnrun --bndb-save` when
+the edits succeeded.
+
+```sh
+bnannotate --bndb $DB --save R:0x10014fed0:nhv_proc "C:0x10014fed0:called once per voice"
+```
+
+Writing your own: print errors (the bridge returns `print()` output, not `sys.stderr`) and end
+a failed run with `sys.exit("message")`. The bridge reports that as the error, with exit
+status 1 and no traceback; `sys.exit()` / `sys.exit(0)` count as success.
 
 ## Cancelling scripts
 
@@ -310,7 +359,8 @@ All endpoints need the token (see [Security](#security)).
   `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `bndb`, `state`,
   `running_for`, `cancel_requested`.
 - `GET /lock`: the lock, plus the same keys as `GET /run`.
-- `POST /run`: runs a script; takes `"timeout"` (seconds), `"run_id"`, `"parallel"`,
+- `POST /run`: runs a script (`sys.exit()` ends it: no status or 0 is success, a string is
+  the `error`, another value `"script exited with status N"`); takes `"timeout"` (seconds), `"run_id"`, `"parallel"`,
   `"bndb"` (path), `"args"` (list of str) and `"env"` (str→str). Answers 400 for parallel
   with main_thread/view, bndb with view/main_thread/parallel, a bad `args`/`env` type or a
   missing `--bndb` file; 409 for view/main_thread without the lock.
@@ -341,8 +391,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 `tests/test_bridge.py` covers `bridge_server.py` (bridge, lock, cancellation and timeouts
 including a fake main-thread runner, the parallel lane and its slot limit, the UI-view rules,
 args/env forwarding, the `--bndb` cache with fake hooks, the MCP proxy against a fake upstream
-including the tool allowlist), `bnrun` (including Ctrl-C/SIGTERM and `--max-out`) and
-`mcp-session-header`, with a fake namespace and a fake home directory. The plugin glue
+including the tool allowlist), `bnrun` (including Ctrl-C/SIGTERM and `--max-out`), the
+bundled scripts and `bnannotate` against a fake BinaryView, and `mcp-session-header`, with a fake namespace and a fake home directory. The plugin glue
 (`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's
 MCP server, the real `--bndb` open/save/close) only runs inside Binary Ninja and is not
 covered.

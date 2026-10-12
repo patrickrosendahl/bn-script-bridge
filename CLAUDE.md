@@ -17,5 +17,5 @@ ln -s /Users/patrick/rev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/sk
 - For a single project only, link into that project's `.claude/skills/` instead
   (a `skills/<name>/SKILL.md` file symlink inside the project also works).
 - Check with `ls -l ~/.claude/skills/`; new sessions pick it up.
-- The skill hard-codes the absolute paths to `bnrun` and `bnrestart` in this
-  checkout -- update them in `SKILL.md` if the repo moves.
+- The skill hard-codes the absolute paths to `bnrun`, `bnannotate`, `bnrestart` and `scripts/`
+  in this checkout -- update them in `SKILL.md` and `reference.md` if the repo moves.

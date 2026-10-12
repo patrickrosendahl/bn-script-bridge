@@ -224,7 +224,16 @@ def run_script(code: str, namespace: Dict[str, Any],
                 "result": _jsonable(namespace.get("result")), "error": None}
     except ScriptCancelled:
         return {"ok": False, "stdout": out.getvalue(), "result": None, "error": "cancelled"}
-    except BaseException:  # noqa: BLE001 -- report everything, including SystemExit
+    except SystemExit as e:
+        # sys.exit() ends the script like a command: no status (or 0) is success, a string
+        # is the error message, anything else an exit status. No traceback either way.
+        if e.code is None or e.code == 0:
+            return {"ok": True, "stdout": out.getvalue(),
+                    "result": _jsonable(namespace.get("result")), "error": None}
+        message = e.code if isinstance(e.code, str) else "script exited with status %s" % e.code
+        return {"ok": False, "stdout": out.getvalue(), "result": None,
+                "error": message.rstrip("\n") + "\n"}
+    except BaseException:  # noqa: BLE001 -- report everything
         return {"ok": False, "stdout": out.getvalue(), "result": None,
                 "error": traceback.format_exc()}
 

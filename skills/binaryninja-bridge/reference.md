@@ -7,6 +7,8 @@ Cold material; SKILL.md covers the hot path. Read the section you need.
 - Exit codes: 0 ok · 1 script error or cancelled (traceback on stderr) · 2 bridge refused/unreachable or UI-view rules violated · 3 locked by another session · 130 Ctrl-C.
 - Lock ttl 5 min (max 240); the holder's own script runs renew it. `--cancel` hits this session's running scripts; the lock holder (or anyone with `--force`) cancels all — ask before touching others'. Ctrl-C/SIGTERM while `bnrun` waits cancels that script inside BN too (per-run run id, only ever its own).
 - **Cancellation lands only between Python bytecodes** (`PyThreadState_SetAsyncExc`, a `BaseException` so `except Exception` doesn't swallow it): a script blocked in a long native call (`update_analysis_and_wait`, `time.sleep`, one big API call) stops only when it returns. Write long jobs as bounded loops over small steps with progress prints and `--timeout`. Partial edits before a cancel stay (no rollback); a script that catches `BaseException` and carries on can't be cancelled.
+- SCRIPT ending in `.py` is a file; anything else names a bundled script in `scripts/` (unknown name: exit 2 with the list). Each documents its arguments at the top.
+- Writing scripts: errors go through `print()` (the bridge returns `print()` output, not `sys.stderr`); end a failed run with `sys.exit("message")` -- exit 1, message on stderr, no traceback (`sys.exit()`/`sys.exit(0)` = success). `--bndb` and `--bndb-save`/`--bndb-close` paths are made absolute by `bnrun`, other paths aren't.
 - `bnrun` hanging = a script (maybe another session's) is running or queued: `--status`, then `--cancel` (own) or ask before `--cancel --force`.
 
 ## The `--bndb` cache

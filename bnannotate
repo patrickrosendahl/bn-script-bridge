@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Rename and comment in Binary Ninja: shorthand for `bnrun [OPTIONS] annotate -- DIRECTIVE ...`.
+
+    bnannotate [BNRUN OPTIONS] DIRECTIVE ...
+    bnannotate --bndb /abs/x.bndb R:0x10014fed0:nhv_proc "C:0x10014fed0:called per voice"
+    bnannotate --bndb /abs/x.bndb --save D:0x1002a0000:voice_table   (and save the .bndb)
+
+Arguments shaped like R:..., D:... or C:... (and everything after a standalone `--`) are
+directives; all others go to bnrun unchanged (--bndb, --view, --session, --timeout, ...).
+Directives (see scripts/annotate.py): R:ADDR:NAME renames the function at ADDR, D:ADDR:NAME
+the data symbol, C:ADDR:TEXT sets a comment. All are checked before any is applied.
+--save (with --bndb) runs `bnrun --bndb-save` for that database when the edits succeeded.
+"""
+import os
+import re
+import signal
+import subprocess
+import sys
+
+BNRUN = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bnrun")
+DIRECTIVE = re.compile(r"[RDC]:")
+
+
+def split(argv):
+    """(bnrun options, directives, save?)."""
+    options, directives, save = [], [], False
+    for i, arg in enumerate(argv):
+        if arg == "--":
+            directives += argv[i + 1:]
+            break
+        if arg == "--save":
+            save = True
+        elif DIRECTIVE.match(arg):
+            directives.append(arg)
+        else:
+            options.append(arg)
+    return options, directives, save
+
+
+def bndb_of(options):
+    for i, arg in enumerate(options):
+        if arg == "--bndb" and i + 1 < len(options):
+            return options[i + 1]
+        if arg.startswith("--bndb="):
+            return arg[len("--bndb="):]
+    return None
+
+
+def main() -> int:
+    if sys.argv[1:] in ([], ["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    options, directives, save = split(sys.argv[1:])
+    bndb = bndb_of(options)
+    if save and bndb is None:
+        print("bnannotate: --save needs --bndb (save a UI view from Binary Ninja)",
+              file=sys.stderr)
+        return 2
+    run = [sys.executable, BNRUN, *options, "annotate", "--", *directives]
+    if not save:
+        os.execv(sys.executable, run)       # bnrun itself handles Ctrl-C (cancels the script)
+    # Ctrl-C reaches bnrun through the terminal's process group; don't kill it from here
+    # before it has cancelled the script in Binary Ninja. A no-op handler, not SIG_IGN: an
+    # ignored SIGINT would be inherited by bnrun, a handler resets to the default on exec.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    status = subprocess.call(run)
+    if status != 0:
+        return status
+    return subprocess.call([sys.executable, BNRUN, "--bndb-save", os.path.abspath(bndb)])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

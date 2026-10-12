@@ -12,10 +12,16 @@
     bnrun --bndb-save [PATH]                           (save cached view(s) into their .bndb)
     bnrun --bndb-close [PATH]                          (close and drop cached view(s))
 
-SCRIPT defaults to stdin. Every script sees `binaryninja`/`bn`; print() output comes back, and
-so does `result` if the script sets it. Exit status: 0 ok, 1 script error (or cancelled),
-2 bridge unreachable or refused, 3 Binary Ninja is locked by someone else, 130 interrupted
-(Ctrl-C; the script is cancelled in Binary Ninja too).
+SCRIPT defaults to stdin. Ending in .py it is a file (check.py, /abs/check.py); anything else
+names a bundled script (scripts/<name>.py in this repo): annotate (R:/D:/C: renames and comments),
+info (F:/S: function and settings queries), decompile (un-skip + HLIL); each documents its
+arguments at the top, e.g. `bnrun --bndb /abs/x.bndb annotate -- R:0x401000:parse_header`.
+
+Every script sees `binaryninja`/`bn`; print() output comes back, and so does `result` if the
+script sets it; sys.exit("message") fails with that message instead of a traceback. Exit
+status: 0 ok, 1 script error (or cancelled), 2 bridge unreachable or refused, 3 Binary Ninja
+is locked by someone else, 130 interrupted (Ctrl-C; the script is cancelled in Binary Ninja
+too).
 
 Arguments and environment: everything after a standalone `--` is the script's argv (argv[0] is
 the script filename, or "<bnrun>" for -e/stdin), given to the script as `argv` and, for a
@@ -77,6 +83,22 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from bridge_server import describe, describe_run, describe_runs  # noqa: E402
 
 DEFAULT_CONFIG = os.path.expanduser("~/Library/Application Support/Binary Ninja/script_bridge.json")
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "scripts")
+
+
+def bundled_scripts():
+    try:
+        return sorted(n[:-3] for n in os.listdir(SCRIPTS_DIR) if n.endswith(".py"))
+    except FileNotFoundError:
+        return []
+
+
+def resolve_script(name):
+    """The file to run for SCRIPT: ending in .py it is a file; anything else names a bundled
+    script (`annotate` -> scripts/annotate.py), None if there is no such one."""
+    if name.endswith(".py"):
+        return name
+    return os.path.join(SCRIPTS_DIR, name + ".py") if name in bundled_scripts() else None
 
 
 def _split_script_args(argv):
@@ -93,7 +115,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  epilog=__doc__.split("\n", 2)[2],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("script", nargs="?", help="script file (default: stdin)")
+    ap.add_argument("script", nargs="?", help="script file (*.py) or "
+                    "bundled script name (default: stdin)")
     ap.add_argument("-e", dest="code", help="code to run instead of a file")
     ap.add_argument("--view", help="select the open view whose filename contains this")
     ap.add_argument("--main-thread", action="store_true", help="run on the UI thread "
@@ -148,6 +171,7 @@ def main() -> int:
                      "--bndb runs serialize)")
         if not os.path.isfile(args.bndb):
             ap.error("--bndb file not found: %s" % args.bndb)
+        args.bndb = os.path.abspath(args.bndb)     # Binary Ninja's cwd isn't ours
     env_vars = {}
     for item in args.env:
         key, sep, value = item.partition("=")
@@ -167,7 +191,12 @@ def main() -> int:
     if args.code is not None:
         code = args.code
     elif args.script and args.script != "-":
-        code = open(args.script).read()
+        path = resolve_script(args.script)
+        if path is None:
+            ap.error("no bundled script %r (bundled: %s); a file must end in .py"
+                     % (args.script, ", ".join(bundled_scripts()) or "none"))
+        args.script = path
+        code = open(path).read()
     else:
         code = sys.stdin.read()
 
@@ -316,7 +345,8 @@ def bndb_command(args) -> int:
     action = "save" if args.bndb_save is not None else "close"
     path = args.bndb_save if action == "save" else args.bndb_close
     timeout = 300 if action == "save" else 30    # a save can write a whole .bndb
-    status, reply = call("/bndb", {"action": action, "path": path or None,
+    status, reply = call("/bndb", {"action": action,
+                                   "path": os.path.abspath(path) if path else None,
                                    "session": args.session}, timeout,
                          passthrough=(404, 409, 423))
     if status == 423:
