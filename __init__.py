@@ -63,6 +63,66 @@ def _namespace(view_filter):
     return {"bv": bv, "bvs": views, "binaryninja": binaryninja, "bn": binaryninja}
 
 
+def _open_elsewhere(path):
+    """A message naming where `path` is already open in Binary Ninja (a cached --bndb view,
+    or an MCP/UI file context), or None when it isn't. Opening a .bndb twice gives it two
+    database handles; both look fully writable, but then saves fail on BOTH lanes until
+    one of the two closes without saving -- edits on that side are lost."""
+    abs_path = os.path.abspath(path)
+    if _bridge is not None and abs_path in _bridge.bndb_views:
+        return "%s is already open as a bnrun --bndb cached view" % path
+    try:
+        from binaryninjaui import FileContext
+        for fc in FileContext.getOpenFileContexts() or []:
+            try:
+                name = fc.getFilename()
+            except Exception:
+                continue
+            if name and os.path.abspath(name) == abs_path:
+                return "%s is already open in Binary Ninja (an MCP/UI file)" % path
+    except Exception:
+        pass                      # headless / UI not up yet: nothing to compare against
+    return None
+
+
+def _mcp_open_guard(path):
+    """The proxy's open_guard (see McpProxy.__init__): refuse bn_open_item_open for files
+    that are already open, keeping one handle per .bndb."""
+    refusal = _open_elsewhere(path)
+    if refusal is None:
+        return None
+    return (refusal + "; opening it twice would deadlock saves on both lanes. Reuse the "
+            "open view (bn_open_item_list, or the cached bnrun --bndb view), or close it "
+            "first (bnrun --bndb-close, or the file's tab/MCP item) -- without saving.")
+
+
+def _bndb_open(path):
+    """Open a headless cached view for a --bndb run (a .bndb opens its database; a raw binary
+    is analysed once). Runs on an HTTP handler thread, like a --parallel script's own view.
+    Refuses (returns None) when the file is already open elsewhere, for the same
+    one-handle-per-.bndb rule as the MCP proxy's open_guard."""
+    busy = _open_elsewhere(path)
+    if busy:
+        log_warn("bnrun --bndb refused: " + busy)
+        return None
+    bv = binaryninja.load(path)
+    if bv is None:
+        return None
+    bv.update_analysis_and_wait()      # near no-op for a .bndb; the raw-binary analysis wait
+    return bv
+
+
+def _bndb_save(bv):
+    f = bv.file
+    if f.has_database:
+        return f.save_auto_snapshot()
+    return bv.create_database(f.filename + ".bndb")   # raw binary: materialize a .bndb
+
+
+def _bndb_close(bv):
+    bv.file.close()
+
+
 def _log_lock(event, status):
     log_info("Script bridge lock %s: %s" % (event, bridge_server.describe(status)))
 
@@ -151,12 +211,16 @@ def start(*_args):
     _bridge = bridge_server.ScriptBridge(
         token, _namespace, execute_on_main_thread_and_wait, lock=lock,
         max_parallel=lambda: Settings().get_integer("scriptbridge.maxParallel"),
-        base_namespace={"binaryninja": binaryninja, "bn": binaryninja})
+        base_namespace={"binaryninja": binaryninja, "bn": binaryninja},
+        bndb_open=_bndb_open, bndb_save=_bndb_save, bndb_close=_bndb_close)
     try:
         settings = Settings()
         _proxy = bridge_server.McpProxy(lock, settings.get_integer("ui.mcp.port"),
                                         settings.get_integer("scriptbridge.mcpProxyPort"),
-                                        upstream_token=settings.get_string("ui.mcp.token"))
+                                        upstream_token=settings.get_string("ui.mcp.token"),
+                                        allowed_tools=lambda: Settings().get_string(
+                                            "scriptbridge.mcpTools"),
+                                        open_guard=_mcp_open_guard)
         _proxy.start()
         log_info("MCP proxy listening on 127.0.0.1:%d/mcp" % _proxy.port)
         _secure_mcp_server()
@@ -219,6 +283,17 @@ Settings().register_setting("scriptbridge.mcpProxyPort", json.dumps({
     "description": "Port of the MCP proxy started with the script bridge. MCP clients connect "
                    "here instead of to Binary Ninja's MCP server (ui.mcp.port) so the usage "
                    "lock applies; it adds the tools bn_owner_get and bn_owner_set.",
+    "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
+}))
+Settings().register_setting("scriptbridge.mcpTools", json.dumps({
+    "title": "MCP tools advertised to MCP clients",
+    "type": "string",
+    "default": bridge_server.DEFAULT_MCP_TOOLS,
+    "description": "Comma-separated fnmatch patterns (e.g. bn_function_*,bn_memory_read) "
+                   "naming the Binary Ninja MCP tools the proxy advertises and forwards; "
+                   "everything else is hidden and refused locally. Empty: all tools pass "
+                   "(plus bn_owner_get / bn_owner_set, which always pass). Read live. Use "
+                   "fewer tools to keep MCP clients' context small.",
     "ignore": ["SettingsProjectScope", "SettingsResourceScope"],
 }))
 

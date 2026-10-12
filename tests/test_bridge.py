@@ -309,7 +309,7 @@ class CancelTest(BridgeFixture):
         self.assertEqual(self.request("GET", "/run")[1], {"ok": True, "running": None,
                                                           "queued": 0, "parallel": [],
                                                           "parallel_queued": 0,
-                                                          "max_parallel": 4})
+                                                          "max_parallel": 4, "bndb": []})
         status, reply = self.request("POST", "/run", {"code": "result = sum(range(100000))"})
         self.assertEqual((status, reply["ok"], reply["result"]), (200, True, 4999950000))
 
@@ -648,6 +648,394 @@ class ParallelTest(BridgeFixture):
         self.assertEqual(box["reply"][1]["result"], "done")
 
 
+class ArgsEnvTest(BridgeFixture):
+    """args/env forwarding: bare names everywhere, sys.argv/os.environ swap serialized only.
+
+    The bridge runs in-process, so the test's own sys.argv / os.environ ARE the swapped
+    globals -- which also lets us assert the restore."""
+
+    def test_serialized_argv_and_env_swapped_and_restored(self):
+        saved_argv, saved_environ = sys.argv, os.environ.get("BN_T_X")
+        try:
+            status, reply = self.request("POST", "/run", {
+                "code": "import sys, os\n"
+                        "result = {'argv': sys.argv, 'x': os.environ.get('BN_T_X'), "
+                        "'y': os.environ.get('BN_T_Y')}",
+                "args": ["s.py", "x", "--y"], "env": {"BN_T_X": "set", "BN_T_Y": "new"}})
+            self.assertEqual(status, 200)
+            self.assertTrue(reply["ok"])
+            self.assertEqual(reply["result"], {"argv": ["s.py", "x", "--y"], "x": "set",
+                                               "y": "new"})
+            self.assertEqual(sys.argv, saved_argv)
+            self.assertEqual(os.environ.get("BN_T_X"), saved_environ)
+        finally:
+            os.environ.pop("BN_T_Y", None)
+
+    def test_pre_existing_env_restored(self):
+        os.environ["BN_T_Y"] = "old"
+        try:
+            _, reply = self.request("POST", "/run", {
+                "code": "import os\nresult = os.environ['BN_T_Y']", "env": {"BN_T_Y": "new"}})
+            self.assertEqual(reply["result"], "new")
+            self.assertEqual(os.environ["BN_T_Y"], "old")
+        finally:
+            os.environ.pop("BN_T_Y", None)
+
+    def test_env_restored_when_script_raises(self):
+        _, reply = self.request("POST", "/run", {
+            "code": "import os\nresult = os.environ['BN_T_Z']\n1/0", "env": {"BN_T_Z": "v"}})
+        self.assertFalse(reply["ok"])
+        self.assertIsNone(os.environ.get("BN_T_Z"))
+
+    def test_bare_names_in_both_lanes(self):
+        code = "result = [argv, env]"
+        _, reply = self.request("POST", "/run", {"code": code, "args": ["s.py", "a"],
+                                                 "env": {"K": "V"}})
+        self.assertEqual(reply["result"], [["s.py", "a"], {"K": "V"}])
+        _, reply = self.request("POST", "/run", {"code": code, "args": ["p.py"],
+                                                 "env": {"K": "V"}, "parallel": True})
+        self.assertEqual(reply["result"], [["p.py"], {"K": "V"}])
+
+    def test_parallel_never_swaps_sys_argv(self):
+        saved_argv = sys.argv
+        _, reply = self.request("POST", "/run", {
+            "code": "import sys\nresult = sys.argv[0] != 'p.py'", "args": ["p.py"],
+            "parallel": True})
+        self.assertTrue(reply["result"])
+        self.assertEqual(sys.argv, saved_argv)
+
+    def test_no_swap_when_args_and_env_absent(self):
+        saved_argv = sys.argv
+        _, reply = self.request("POST", "/run", {"code": "import sys\nresult = sys.argv"})
+        self.assertEqual(reply["result"], saved_argv)
+        self.assertEqual(sys.argv, saved_argv)
+
+    def test_no_swap_without_a_view_even_when_the_lock_is_free(self):
+        # A serialized run without view/main_thread doesn't need the lock; the swap must
+        # still happen for it (serialized lane, no overlap).
+        saved_argv = sys.argv
+        _, reply = self.request("POST", "/run", {
+            "code": "import sys\nresult = sys.argv[1:]", "args": ["s.py", "flag"]})
+        self.assertEqual(reply["result"], ["flag"])
+        self.assertEqual(sys.argv, saved_argv)
+
+    def test_bad_args_and_env(self):
+        for req in ({"args": "s.py"}, {"args": [1]}, {"env": ["K=V"]}, {"env": {"K": 1}}):
+            status, reply = self.request("POST", "/run", {"code": "pass", **req})
+            self.assertEqual((status, reply["ok"]), (400, False), req)
+            self.assertIn("bad request", reply["error"])
+
+    def test_bnrun_dash_dash_and_env(self):
+        r = self.bnrun("-e", "import sys\nresult = sys.argv", "--", "a", "b")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(json.loads(r.stdout), ["<bnrun>", "a", "b"])
+        r = self.bnrun("-e", "import sys\nresult = sys.argv")
+        self.assertEqual(json.loads(r.stdout), ["<bnrun>"])
+        path = os.path.join(self.tmp.name, "s.py")
+        with open(path, "w") as f:
+            f.write("import sys\nresult = sys.argv")
+        r = self.bnrun(path, "--", "x")
+        self.assertEqual(json.loads(r.stdout), [path, "x"])
+        r = self.bnrun("-e", "import os\nresult = os.environ.get('BN_T_W')",
+                       "--env", "BN_T_W=V")
+        self.assertEqual(r.stdout, "V\n")
+        r = self.bnrun("-e", "pass", "--env", "BN_T_W")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--env expects K=V", r.stderr)
+
+    def test_bnrun_dash_dash_works_without_args(self):
+        r = self.bnrun("-e", "result = argv", "--")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(json.loads(r.stdout), ["<bnrun>"])
+
+
+class MaxOutTest(BridgeFixture):
+    """--max-out: truncate on the terminal, keep the full output in a file."""
+
+    def bnrun(self, *args, stdin=""):
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config,
+                   HOME=self.tmp.name, XDG_CACHE_HOME=os.path.join(self.tmp.name, ".cache"))
+        return subprocess.run([sys.executable, BNRUN, *args], input=stdin, capture_output=True,
+                              text=True, env=env, timeout=30)
+
+    def cache_files(self):
+        cache = os.path.join(self.tmp.name, ".cache", "bn-script-bridge")
+        return sorted(os.listdir(cache)) if os.path.isdir(cache) else []
+
+    def test_truncates_and_persists(self):
+        r = self.bnrun("-e", "print('x' * 500)\nresult = 'y' * 500", "--max-out", "100")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(r.stdout.startswith("x" * 100))
+        self.assertIn("bnrun: truncated at 100 characters; full output: ", r.stdout)
+        files = self.cache_files()
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.tmp.name, ".cache", "bn-script-bridge", files[0])) as f:
+            full = f.read()
+        self.assertEqual(len(full), 1001)      # 500 x's + \n + 500 y's
+        self.assertTrue(full.startswith("x" * 500))
+        self.assertIn("y" * 500, full)
+
+    def test_short_output_untouched(self):
+        r = self.bnrun("-e", "print('hi')\nresult = 42", "--max-out", "1000")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "hi\n42\n")
+        self.assertEqual(self.cache_files(), [])
+
+    def test_json_mode_persists_full_dump(self):
+        r = self.bnrun("-e", "result = 'z' * 300", "--json", "--max-out", "50")
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(r.stdout.startswith("{"))
+        self.assertIn("bnrun: truncated at 50 characters; full output: ", r.stdout)
+        files = self.cache_files()
+        self.assertEqual(len(files), 1)
+
+    def test_errors_are_never_truncated(self):
+        r = self.bnrun("-e", "1/0", "--max-out", "10")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ZeroDivisionError", r.stderr)
+        self.assertEqual(self.cache_files(), [])
+
+    def test_bad_max_out(self):
+        r = self.bnrun("-e", "pass", "--max-out", "0")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--max-out must be at least 1", r.stderr)
+
+
+class CachedView:
+    """A fake BinaryView: identity is the (real) file path it was opened for."""
+    def __init__(self, path):
+        self.path = path
+        self.saved = 0
+        self.closed = False
+
+
+class BndbCacheTest(BridgeFixture):
+    """The --bndb cache: one headless view per path, serialized lane, no lock needed."""
+
+    run_async = CancelTest.run_async
+    wait_running = CancelTest.wait_running
+
+    def setUp(self):
+        super().setUp()
+        self.opened = []
+
+        def open_view(path):
+            self.opened.append(path)
+            return CachedView(path)
+
+        def save_view(v):
+            v.saved += 1
+            return True
+
+        def close_view(v):
+            v.closed = True
+
+        self.bridge.bndb_open = open_view
+        self.bridge.bndb_save = save_view
+        self.bridge.bndb_close = close_view
+
+    def path(self, name="target.bndb"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as f:
+            f.write("x")
+        return path
+
+    def run_bndb(self, path, **extra):
+        return self.request("POST", "/run", dict({"code": "result = bv.path", "bndb": path},
+                                                 **extra))
+
+    def test_caches_by_abspath(self):
+        path = self.path()
+        _, reply = self.run_bndb(path)
+        self.assertEqual(reply["result"], path)
+        self.assertEqual(self.opened, [os.path.abspath(path)])
+        _, reply = self.run_bndb(os.path.join(self.tmp.name, "..", os.path.basename(self.tmp.name),
+                                              "target.bndb"))
+        self.assertEqual(reply["result"], path)      # abspath-normalized: same view
+        self.assertEqual(self.opened, [os.path.abspath(path)])   # opened once
+        other = self.path("other.bndb")
+        _, reply = self.run_bndb(other)
+        self.assertEqual(reply["result"], other)
+        self.assertEqual(len(self.opened), 2)
+
+    def test_bvs_is_a_placeholder(self):
+        path = self.path()
+        _, reply = self.run_bndb(path)
+        self.assertTrue(reply["ok"])
+        _, reply = self.request("POST", "/run", {
+            "code": "try:\n    len(bvs)\nexcept Exception as e:\n    result = str(e)",
+            "bndb": path})
+        self.assertIn("not available", reply["result"])
+        self.assertIn(bridge_server.BNDB_BVS, reply["result"])
+        _, reply = self.request("POST", "/run", {"code": "result = repr(bvs)", "bndb": path})
+        self.assertTrue(reply["ok"])
+
+    def test_combo_400s_and_no_lock_needed(self):
+        path = self.path()
+        for extra in ({"view": "x"}, {"main_thread": True}, {"parallel": True}):
+            status, reply = self.run_bndb(path, **extra)
+            self.assertEqual((status, reply["ok"]), (400, False))
+            self.assertIn(bridge_server.BNDB_NO_UI, reply["error"])
+        status, reply = self.run_bndb(path)          # no lock held: still runs
+        self.assertEqual((status, reply["ok"]), (200, True))
+        self.hold_lock("other")                      # another session holds it: 423
+        status, reply = self.run_bndb(path)
+        self.assertEqual(status, 423)
+
+    def test_not_found_and_bad_types(self):
+        status, reply = self.run_bndb(os.path.join(self.tmp.name, "missing.bndb"))
+        self.assertEqual((status, reply["ok"]), (400, False))
+        self.assertIn("not found", reply["error"])
+        for bad in (123, ""):
+            status, reply = self.request("POST", "/run", {"code": "pass", "bndb": bad})
+            self.assertEqual(status, 400)
+
+    def test_open_failure_reports_and_leaves_cache_empty(self):
+        path = self.path()
+
+        def failing(path):
+            raise RuntimeError("nope")
+
+        self.bridge.bndb_open = failing
+        _, reply = self.run_bndb(path)
+        self.assertFalse(reply["ok"])
+        self.assertIn("nope", reply["error"])
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"], [])
+        self.bridge.bndb_open = lambda p: None     # None: also a failure
+        _, reply = self.run_bndb(path)
+        self.assertFalse(reply["ok"])
+        self.assertIn("couldn't open", reply["error"])
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"], [])
+        self.bridge.bndb_open = lambda p: CachedView(p)   # good again
+        _, reply = self.run_bndb(path)
+        self.assertTrue(reply["ok"])
+
+    def test_no_hooks_is_a_400(self):
+        self.bridge.bndb_open = None
+        status, reply = self.run_bndb(self.path())
+        self.assertEqual((status, reply["error"]), (400, bridge_server.BNDB_NO_HOOKS))
+
+    def test_status_lists_cached_views(self):
+        path = self.path()
+        self.run_bndb(path)
+        status, reply = self.request("GET", "/run")
+        self.assertEqual(reply["bndb"], [{"path": os.path.abspath(path),
+                                          "name": "target.bndb"}])
+        r = self.bnrun("--status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("cached views: target.bndb", r.stdout)
+        # Idle line unchanged (bnrestart depends on it)
+        self.assertIn("no script running", r.stdout)
+
+    def test_status_of_a_running_bndb_run_shows_it(self):
+        path = self.path()
+        t, box = self.run_async({"code": BUSY, "bndb": path})
+        try:
+            running = self.wait_running()
+            self.assertEqual(running["bndb"], path)
+            self.assertIn("bndb target.bndb", bridge_server.describe_run(running))
+        finally:
+            self.request("POST", "/cancel", {"force": True})
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        _, reply = box["reply"]
+        self.assertEqual(reply["error"], "cancelled")
+
+        status, reply = self.request("GET", "/run")
+        self.assertEqual(reply["bndb"], [{"path": os.path.abspath(path),
+                                          "name": "target.bndb"}])
+        self.assertIn("cached views: target.bndb", bridge_server.describe_runs(
+            self.request("GET", "/run")[1]))
+
+    def test_post_bndb_save_close_all_and_one(self):
+        path_a, path_b = self.path("a.bndb"), self.path("b.bndb")
+        self.run_bndb(path_a)
+        self.run_bndb(path_b)
+        status, reply = self.request("POST", "/bndb", {"action": "save"})
+        self.assertEqual(status, 200)
+        self.assertTrue(reply["ok"])
+        views = {p: self.bridge.bndb_views[os.path.abspath(p)] for p in (path_a, path_b)}
+        self.assertTrue(all(v.saved == 1 for v in views.values()))
+        status, reply = self.request("POST", "/bndb", {"action": "close", "path": path_a})
+        self.assertEqual(status, 200)
+        self.assertTrue(reply["ok"])
+        self.assertTrue(views[path_a].closed)
+        self.assertNotIn(os.path.abspath(path_a), self.bridge.bndb_views)
+        self.assertIn(os.path.abspath(path_b), self.bridge.bndb_views)
+        # closing an unknown path: 404
+        status, reply = self.request("POST", "/bndb", {"action": "close",
+                                                       "path": "/nope.bndb"})
+        self.assertEqual(status, 404)
+        # bad action: 400
+        status, reply = self.request("POST", "/bndb", {"action": "reload"})
+        self.assertEqual(status, 400)
+        # empty cache with no path: a no-op success, not a 404 (bnrestart relies on it)
+        self.request("POST", "/bndb", {"action": "close"})
+        status, reply = self.request("POST", "/bndb", {"action": "save"})
+        self.assertEqual((status, reply["ok"], reply["results"]), (200, True, []))
+
+    def test_post_bndb_refused_while_running_or_locked(self):
+        path = self.path()
+        self.run_bndb(path)
+        t, box = self.run_async({"code": BUSY, "bndb": path})
+        try:
+            running = self.wait_running()
+            status, reply = self.request("POST", "/bndb", {"action": "save"})
+            self.assertEqual(status, 409)
+            self.assertIn("a script is running", reply["error"])
+        finally:
+            self.request("POST", "/cancel", {"force": True})
+            t.join(10)
+        self.assertFalse(t.is_alive())
+        self.hold_lock("other")
+        status, reply = self.request("POST", "/bndb", {"action": "save"})
+        self.assertEqual(status, 423)
+
+    def test_post_bndb_save_failure_reports_per_entry(self):
+        path = self.path()
+        self.run_bndb(path)
+        original = self.bridge.bndb_save
+        self.bridge.bndb_save = lambda v: (_ for _ in ()).throw(RuntimeError("disk full"))
+        try:
+            status, reply = self.request("POST", "/bndb", {"action": "save"})
+            self.assertEqual(status, 200)
+            self.assertFalse(reply["ok"])
+            self.assertIn("disk full", reply["results"][0]["error"])
+        finally:
+            self.bridge.bndb_save = original
+
+    def test_bndb_close_all(self):
+        path = self.path()
+        self.run_bndb(path)
+        view = self.bridge.bndb_views[os.path.abspath(path)]
+        self.bridge.bndb_close_all()
+        self.assertTrue(view.closed)
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"], [])
+        _, reply = self.run_bndb(path)      # reopens after close_all
+        self.assertTrue(reply["ok"])
+        self.assertEqual(len(self.opened), 2)
+
+    def test_bnrun_bndb_flags(self):
+        path = self.path()
+        r = self.bnrun("--bndb", path, "-e", "result = bv.path")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, path + "\n")
+        r = self.bnrun("--bndb-list")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn(os.path.abspath(path), r.stdout)
+        r = self.bnrun("--bndb-save", path)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("saved", r.stdout)
+        r = self.bnrun("--bndb-close", path)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("closed", r.stdout)
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"], [])
+        r = self.bnrun("--bndb", path, "--view", "x")
+        self.assertEqual(r.returncode, 2)
+        r = self.bnrun("--bndb", os.path.join(self.tmp.name, "missing.bndb"), "-e", "pass")
+        self.assertEqual(r.returncode, 2)
+
+
 class UIViewRulesTest(BridgeFixture):
     """UI views (bv, bvs, view, main_thread) only for a serialized script of the lock holder."""
 
@@ -733,7 +1121,8 @@ class UIViewRulesTest(BridgeFixture):
 class FakeMcpUpstream:
     """Stands in for Binary Ninja's MCP server: JSON replies, or SSE when asked."""
 
-    def __init__(self):
+    def __init__(self, tools=("bn_function_list",)):
+        self.tools = list(tools)
         self.requests = []
         upstream = self
 
@@ -753,7 +1142,7 @@ class FakeMcpUpstream:
                     return
                 upstream.requests.append((dict(self.headers), body))
                 if body.get("method") == "tools/list":
-                    result = {"tools": [{"name": "bn_function_list", "inputSchema": {}}]}
+                    result = {"tools": [{"name": n, "inputSchema": {}} for n in upstream.tools]}
                 else:
                     result = {"content": [{"type": "text", "text": "upstream ok"}]}
                 reply = json.dumps({"jsonrpc": "2.0", "id": body.get("id"), "result": result})
@@ -878,6 +1267,107 @@ class McpProxyTest(unittest.TestCase):
         self.assertEqual(resp.status, 502)
 
 
+class McpAllowlistTest(unittest.TestCase):
+    """The scriptbridge.mcpTools allowlist: filter tools/list, gate filtered tools/call."""
+
+    TOOLS = ["bn_function_list", "bn_function_decompile", "bn_memory_read", "bn_other_thing"]
+
+    def setUp(self):
+        self.upstream = FakeMcpUpstream(self.TOOLS)
+        self.lock = bridge_server.UsageLock()
+        self.patterns = {"value": ""}
+        self.proxy = bridge_server.McpProxy(self.lock, self.upstream.port,
+                                            allowed_tools=lambda: self.patterns["value"])
+        self.proxy.start()
+
+    def tearDown(self):
+        self.proxy.stop()
+        self.upstream.stop()
+
+    def rpc(self, method, params=None, session=None, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        h = {"Content-Type": "application/json"}
+        if session:
+            h["X-BN-Session"] = session
+        payload = body if body is not None else {"jsonrpc": "2.0", "id": 1, "method": method,
+                                                 "params": params or {}}
+        conn.request("POST", "/mcp", body=json.dumps(payload), headers=h)
+        resp = conn.getresponse()
+        text = resp.read().decode()
+        conn.close()
+        return resp, text
+
+    def call_tool(self, name, arguments=None, **kw):
+        resp, text = self.rpc("tools/call", {"name": name, "arguments": arguments or {}}, **kw)
+        return json.loads(text)["result"]
+
+    def tool_names(self, **kw):
+        _, text = self.rpc("tools/list", **kw)
+        return [t["name"] for t in json.loads(text)["result"]["tools"]]
+
+    def test_empty_patterns_pass_everything_through(self):
+        self.assertEqual(self.tool_names(), self.TOOLS + ["bn_owner_get", "bn_owner_set"])
+
+    def test_patterns_filter_tools_list_json_and_sse(self):
+        self.patterns["value"] = "bn_function_*,bn_memory_read"
+        names = self.tool_names()
+        self.assertEqual(names, ["bn_function_list", "bn_function_decompile", "bn_memory_read",
+                                 "bn_owner_get", "bn_owner_set"])
+        resp, text = self.rpc("tools/list", {"sse": True})
+        data = [l for l in text.split("\n") if l.startswith("data:")][0]
+        names = [t["name"] for t in json.loads(data[5:])["result"]["tools"]]
+        self.assertEqual(names, ["bn_function_list", "bn_function_decompile", "bn_memory_read",
+                                 "bn_owner_get", "bn_owner_set"])
+
+    def test_patterns_are_read_live(self):
+        self.patterns["value"] = "bn_memory_read"
+        self.assertEqual(self.tool_names(), ["bn_memory_read", "bn_owner_get", "bn_owner_set"])
+        self.patterns["value"] = "bn_other_thing"
+        self.assertEqual(self.tool_names(), ["bn_other_thing", "bn_owner_get", "bn_owner_set"])
+
+    def test_filtered_tool_call_is_answered_locally(self):
+        self.patterns["value"] = "bn_memory_read"
+        n = len(self.upstream.requests)
+        r = self.call_tool("bn_other_thing")
+        self.assertTrue(r["isError"])
+        self.assertIn(bridge_server.TOOL_NOT_ALLOWED % "bn_other_thing",
+                      r["content"][0]["text"])
+        self.assertEqual(len(self.upstream.requests), n)      # never reached Binary Ninja
+        r = self.call_tool("bn_memory_read")                  # allowed: forwarded
+        self.assertFalse(r.get("isError"))
+        self.assertEqual(r["content"][0]["text"], "upstream ok")
+
+    def test_allowlist_and_lock_gate_together(self):
+        self.patterns["value"] = "bn_memory_read"
+        self.call_tool("bn_owner_set", {"name": "fe"}, session="sess-fe")
+        r = self.call_tool("bn_other_thing", session="sess-audio")
+        self.assertTrue(r["isError"])
+        self.assertIn(bridge_server.TOOL_NOT_ALLOWED % "bn_other_thing",
+                      r["content"][0]["text"])   # allowlist named, not the lock
+        r = self.call_tool("bn_memory_read", session="sess-audio")   # allowed but locked out
+        self.assertTrue(r.get("isError"))
+        self.assertIn("locked by fe", r["content"][0]["text"])
+
+    def test_owner_tools_bypass_the_allowlist(self):
+        self.patterns["value"] = "bn_memory_read"
+        self.assertFalse(self.call_tool("bn_owner_get")["isError"])
+        r = self.call_tool("bn_owner_set", {"name": "x"}, session="s")
+        self.assertFalse(r.get("isError"))
+
+    def test_batch_with_a_filtered_call_is_wholly_answered(self):
+        self.patterns["value"] = "bn_memory_read"
+        body = [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "bn_memory_read", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "bn_other_thing", "arguments": {}}},
+        ]
+        resp, text = self.rpc(None, body=body)
+        replies = json.loads(text)
+        self.assertEqual(len(replies), 2)
+        self.assertTrue(replies[1]["result"]["isError"])
+        self.assertIn(bridge_server.TOOL_NOT_ALLOWED % "bn_other_thing",
+                      replies[1]["result"]["content"][0]["text"])
 
 
 class McpProxyUpstreamTokenTest(unittest.TestCase):
@@ -945,6 +1435,69 @@ class SessionHeaderHelperTest(unittest.TestCase):
         headers, log = self.run_helper()
         self.assertEqual(headers, {})
         self.assertIn("source=none", log)
+
+
+class McpProxyOpenGuardTest(unittest.TestCase):
+    """The proxy refuses bn_open_item_open calls the plugin's open_guard rejects,
+    so a .bndb is never opened twice (two database handles deadlock both saves)."""
+
+    def setUp(self):
+        self.upstream = FakeMcpUpstream()
+        self.proxy = bridge_server.McpProxy(
+            bridge_server.UsageLock(), self.upstream.port, port=0,
+            open_guard=lambda p: ("already open: %s" % p) if "busy" in p else None)
+        self.proxy.start()
+
+    def tearDown(self):
+        self.proxy.stop()
+        self.upstream.stop()
+
+    def call(self, name, path, ident=1):
+        body = {"jsonrpc": "2.0", "id": ident, "method": "tools/call",
+                "params": {"name": name, "arguments": {"path": path}}}
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        conn.request("POST", "/mcp", json.dumps(body),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        reply = json.loads(resp.read())
+        conn.close()
+        return reply
+
+    def text(self, reply):
+        return reply["result"]["content"][0]["text"]
+
+    def test_refused_open_is_answered_by_the_proxy(self):
+        reply = self.call(bridge_server.OPEN_TOOL_NAME, "/x/busy.bndb")
+        self.assertTrue(reply["result"]["isError"])
+        self.assertIn("already open: /x/busy.bndb", self.text(reply))
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_allowed_open_is_forwarded(self):
+        reply = self.call(bridge_server.OPEN_TOOL_NAME, "/x/free.bndb")
+        self.assertFalse(reply["result"].get("isError", False))
+        self.assertEqual(self.text(reply), "upstream ok")
+        self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_other_tools_with_the_same_path_are_forwarded(self):
+        self.call("bn_function_decompile", "/x/busy.bndb")
+        self.assertEqual(len(self.upstream.requests), 1)
+
+    def test_batch_is_refused_as_a_whole(self):
+        batch = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": bridge_server.OPEN_TOOL_NAME,
+                             "arguments": {"path": "/x/busy.bndb"}}},
+                 {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                  "params": {"name": "bn_function_decompile",
+                             "arguments": {"path": "/x/free.bndb"}}}]
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy.port, timeout=10)
+        conn.request("POST", "/mcp", json.dumps(batch),
+                     {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        replies = json.loads(resp.read())
+        conn.close()
+        self.assertEqual([r["id"] for r in replies], [1, 2])
+        self.assertTrue(all(r["result"]["isError"] for r in replies))
+        self.assertEqual(self.upstream.requests, [])
 
 
 if __name__ == "__main__":

@@ -131,6 +131,14 @@ def main() -> int:
             # reopen the database where there is one (including any just created above)
             files = sorted({v["file"] + ".bndb" if os.path.exists(v["file"] + ".bndb") else v["file"]
                             for v in views if os.path.exists(v["file"])})
+            # save the cached headless views too (bnrun --bndb ...); best effort -- the cache
+            # dies with the process anyway, so a failure is not worth aborting the restart
+            flushed = bnrun("--bndb-save", timeout=300)
+            if flushed.returncode != 0:
+                print("bnrestart: saving cached .bndb views failed (continuing): %s"
+                      % (flushed.stdout + flushed.stderr).strip(), file=sys.stderr)
+            elif flushed.stdout.strip():
+                print(flushed.stdout.strip())
 
         print("bnrestart: quitting Binary Ninja")
         if args.discard:

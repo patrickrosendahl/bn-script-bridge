@@ -3,11 +3,17 @@
 Cold material; SKILL.md covers the hot path. Read the section you need.
 
 ## Full bnrun surface
-- Flags: `--view SUBSTR` · `--timeout N` (bridge cancels after N s) · `--json` (raw response) · `--main-thread` (UI objects via `binaryninjaui`; blocks the UI; lock) · `--parallel` (own throwaway views; refuses with `--view`/`--main-thread`) · `--lock --purpose` / `--unlock` [`--force`] / `--status` / `--cancel` [`--force`] · `--session`/`--name` (default `$CLAUDE_CODE_SESSION_ID` / `$BN_SESSION_NAME`).
+- Flags: `--view SUBSTR` · `--bndb PATH` (cached headless view) · `-- ARGS` / `--env K=V` (script's `argv`/`env`) · `--max-out N` · `--timeout N` (bridge cancels after N s) · `--json` (raw response) · `--main-thread` (UI objects via `binaryninjaui`; blocks the UI; lock) · `--parallel` (own throwaway views; refuses with `--view`/`--main-thread`) · `--lock --purpose` / `--unlock` [`--force`] / `--status` / `--cancel` [`--force`] · `--session`/`--name` (default `$CLAUDE_CODE_SESSION_ID` / `$BN_SESSION_NAME`).
 - Exit codes: 0 ok · 1 script error or cancelled (traceback on stderr) · 2 bridge refused/unreachable or UI-view rules violated · 3 locked by another session · 130 Ctrl-C.
 - Lock ttl 5 min (max 240); the holder's own script runs renew it. `--cancel` hits this session's running scripts; the lock holder (or anyone with `--force`) cancels all — ask before touching others'. Ctrl-C/SIGTERM while `bnrun` waits cancels that script inside BN too (per-run run id, only ever its own).
 - **Cancellation lands only between Python bytecodes** (`PyThreadState_SetAsyncExc`, a `BaseException` so `except Exception` doesn't swallow it): a script blocked in a long native call (`update_analysis_and_wait`, `time.sleep`, one big API call) stops only when it returns. Write long jobs as bounded loops over small steps with progress prints and `--timeout`. Partial edits before a cancel stay (no rollback); a script that catches `BaseException` and carries on can't be cancelled.
 - `bnrun` hanging = a script (maybe another session's) is running or queued: `--status`, then `--cancel` (own) or ask before `--cancel --force`.
+
+## The `--bndb` cache
+- A `.bndb` opens its database (renames included); a raw binary path is analysed once and `--bndb-save` then creates `<file>.bndb` beside it. `bnrun` waits up to 10 min for `--bndb` runs; `--bndb-save` of a raw binary writes a whole database (300 s).
+- `--bndb-save`/`--bndb-close` take an optional PATH (all cached views without one) and are refused while a serialized script runs. Trap: `--bndb-save foo.py` takes `foo.py` as the PATH -- management commands run no script.
+- **One handle per `.bndb`**: opening a database twice (cached view + UI tab or MCP open) gives two handles that both look writable, but then saves fail on both until one closes unsaved. The bridge refuses a `--bndb` open of a file already open in the UI, and the MCP proxy refuses opening a cached one. Close the other side first.
+- Stop/quit closes the cache **unsaved**; `bnrestart` saves it first. While another session holds the lock, `--bndb` runs are refused (exit 3) like any other.
 
 ## Disassembly, per line
 `fn.instructions` yields `(tokens, length)` tuples per the API version — if the shape is off, probe it in a throwaway script (`result = type(...)`, `dir(...)`) rather than guessing; the real API is right there:
@@ -36,4 +42,5 @@ Open views and the active view are **shared across everything talking to that Bi
 - BN can mis-type integer constants (ioctl codes, flags) as string-table pointers — they show as nonsense strings in calls; treat as ints, note it.
 - `set_comment_at` REPLACES a comment — read the existing one and carry it over.
 - Don't hand-decode a large `bv.read` blob — compute in-script (struct/int.from_bytes).
-- Unsaved work lives in RAM — `save_auto_snapshot()` before it's lost.
+- Unsaved work lives in RAM — `save_auto_snapshot()` (or `--bndb-save` for a cached view) before it's lost.
+- A cancel doesn't interrupt `binaryninja.load` of a big `.bndb` either (native call); it fires when the load returns.

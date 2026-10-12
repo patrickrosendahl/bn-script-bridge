@@ -14,7 +14,7 @@ Contents: `__init__.py` (plugin glue), `bridge_server.py` (bridge, lock, MCP pro
 ## Install
 
 ```sh
-ln -s /Users/patrick/dev/bn-script-bridge ~/Library/Application\ Support/Binary\ Ninja/plugins/bn-script-bridge
+ln -s /Users/patrick/rev/bn-script-bridge ~/Library/Application\ Support/Binary\ Ninja/plugins/bn-script-bridge
 ```
 
 Then restart Binary Ninja. Plugins load only at startup; if several sessions share the
@@ -25,7 +25,7 @@ For Claude Code, install the skill (user scope shown; drop it into a project's
 `.claude/skills/` instead for a single project):
 
 ```sh
-ln -s /Users/patrick/dev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
+ln -s /Users/patrick/rev/bn-script-bridge/skills/binaryninja-bridge ~/.claude/skills/binaryninja-bridge
 ```
 
 The skill needs no MCP registration -- everything runs through `bnrun`. Pointing an MCP
@@ -47,20 +47,28 @@ echo 'result = [f.name for f in bv.functions][:10]' | bnrun
 bnrun --unlock
 
 bnrun --parallel --timeout 600 check.py           # own throwaway views, no lock
+bnrun --bndb synthv-studio.x86_64.bndb dump.py -- out.hlil   # cached headless view, no lock
 ```
 
 The script sees:
 
 - `binaryninja` / `bn`: the API module (always);
 - `bv`: the open view whose filename contains `--view`, else the view active in the UI, else
-  the only open view (not the MCP server's "active" view, which is separate state);
-- `bvs`: all views open in the UI.
+  the only open view (not the MCP server's "active" view, which is separate state); for
+  `--bndb`, the cached headless view of that file instead;
+- `bvs`: all views open in the UI;
+- `argv` / `env`: the arguments after `--` and the `--env K=V` variables (all runs; see
+  [Arguments and environment](#arguments-and-environment)).
 
 `print()` output is returned, and so is `result` if the script sets it (JSON, else `repr`).
 
 Exit status: 0 ok, 1 script error or cancelled, 2 bridge unreachable or refused (including
 the UI-view rules below), 3 Binary Ninja locked by another session, 130 interrupted with
 Ctrl-C.
+
+`--max-out N` keeps one-off queries readable: when stdout+result exceed N characters, bnrun
+prints the first N and writes the full output to `~/.cache/bn-script-bridge/bnrun-<ts>.txt`,
+with the path in the last line. Errors (stderr) are never truncated.
 
 ## Usage lock
 
@@ -120,6 +128,51 @@ script can still reach UI views by other paths (`binaryninjaui.UIContext`, ...);
 global registrations) → serialized + usage lock. Only your own throwaway views → `--parallel`,
 no lock needed. Parallel scripts must not modify UI-opened views, switch the MCP active view or
 save databases; only this convention stops them.
+
+## Arguments and environment
+
+```sh
+bnrun script.py -- arg1 arg2 --flag          # script sees argv == ["script.py", "arg1", ...]
+bnrun script.py -- max 50                    # e.g. result = argv[2] inside the script
+bnrun -e 'import os; result = os.environ["K"]' --env K=V
+```
+
+Everything after a standalone `--` is the script's argv (`argv[0]` is the script filename, or
+`"<bnrun>"` for `-e`/stdin); `--env K=V` (repeatable) forwards environment variables. Both are
+given to every script as the bare names `argv` and `env`, and for a **serialized** run they are
+also swapped into `sys.argv` / merged into `os.environ` for the script's duration, then
+restored — so plain `import sys; sys.argv` and `os.environ["K"]` work. Parallel runs overlap, so
+they get the bare names only (a global swap would corrupt a neighbouring run's view of them).
+
+Corner: the restore puts back the values as they were before the script; if Binary Ninja itself
+changes a forwarded key while the script runs (it doesn't), that change is overwritten.
+
+## The `--bndb` cache: open a database once
+
+One-shot scripts that call `binaryninja.load()` on the raw binary pay the full analysis every
+time (minutes on big binaries). `--bndb` instead opens the file headlessly once, caches the
+view and hands it to each script as `bv` — a `.bndb` opens instantly and carries renames; a raw
+binary is analysed once (the first run) and `--bndb-save` materializes `<file>.bndb` beside it.
+
+```sh
+bnrun --bndb synthv-studio.x86_64.bndb -e 'result = len(list(bv.functions))'
+bnrun --bndb synthv-studio.x86_64.bndb script.py -- extra-arg
+bnrun --bndb-list                                 # what's cached (also in --status)
+bnrun --bndb-save                                 # write renames etc. back into the .bndb
+bnrun --bndb-close                                # free the memory (tens of MB per view)
+```
+
+Rules: `--bndb` runs in the serialized lane (cached views are shared, so runs using them must
+not overlap) but needs **no usage lock** — it touches no UI view — and can't be combined with
+`--view`, `--main-thread` or `--parallel`. `bvs` stays a placeholder that raises with the
+reason. The first open of a big `.bndb` takes a while (30k functions ≈ 85 s) — later runs are
+instant; `bnrun` uses a 10-minute HTTP timeout for `--bndb` runs. While another session holds
+the lock, `--bndb` runs are refused like any other (exit 3).
+
+Management is refused (409) while a serialized script runs; `--bndb-save` of a raw binary
+writes a whole `.bndb` (300 s timeout). **Stop** (or quitting Binary Ninja) closes the cache
+without saving; `bnrestart` saves it first. Note the `nargs` trap: `bnrun --bndb-save foo.py`
+takes `foo.py` as the PATH — management commands take no script.
 
 ## Cancelling scripts
 
@@ -182,13 +235,14 @@ Dock → right-click Binary Ninja → Options → Assign To → This Desktop.
 The plugin runs a lock-aware MCP proxy on 127.0.0.1:24643 (`scriptbridge.mcpProxyPort`) in
 front of Binary Ninja's own MCP server; MCP clients connect to the proxy. This is optional:
 the Claude Code skill does not use it (no `bn_*` MCP tools exist any more -- everything goes
-through `bnrun`); it exists for other MCP clients. To point Claude Code at it (local scope
-shown; `-s user` for all projects):
+through `bnrun`); it exists for other MCP clients. It needs Binary Ninja's own MCP server
+running: enable `ui.mcp.enabled` (Settings, search "MCP") once, or every MCP call answers 502.
+To point Claude Code at it (local scope shown; `-s user` for all projects):
 
 ```sh
 claude mcp remove binaryninja -s local
 claude mcp add-json -s local binaryninja '{"type": "http", "url": "http://127.0.0.1:24643/mcp",
-  "headersHelper": "/Users/patrick/dev/bn-script-bridge/mcp-session-header"}'
+  "headersHelper": "/Users/patrick/rev/bn-script-bridge/mcp-session-header"}'
 ```
 
 The proxy:
@@ -199,8 +253,27 @@ The proxy:
   - `bn_owner_set`: take or renew the lock for the caller (`name`, `purpose`, `ttl_minutes`);
     `release: true` gives it back; `release: true, force: true` force-unlocks another
     session's lock;
+- filters `tools/list` through the `scriptbridge.mcpTools` allowlist (see below) and answers a
+  call of a filtered-out tool locally with a `tool ... is not in the scriptbridge.mcpTools
+  allowlist` error; the call never reaches Binary Ninja;
 - while another session holds the lock, answers every other `tools/call` itself with an error
   naming the holder and purpose; the call never reaches Binary Ninja.
+
+### Tool allowlist (`scriptbridge.mcpTools`)
+
+Binary Ninja's MCP server advertises 70+ tools; that many definitions bloat an MCP client's
+context and degrade its tool choice. The proxy filters `tools/list` down to the patterns in
+`scriptbridge.mcpTools` (Settings, search "script bridge"): comma-separated `fnmatch` globs,
+read live. The default keeps the interactive-RE set (decompile, disassembly, IL, xrefs,
+function/symbol/string lists and searches, memory read, comments, view info); empty = every
+upstream tool passes. `bn_owner_get`/`bn_owner_set` always pass. Everything else stays
+reachable through `bnrun` scripts, which is the more capable path anyway.
+
+```sh
+# examples (Settings > Script Bridge > "MCP tools advertised to MCP clients")
+bn_function_*,bn_memory_read,bn_symbol_rename
+bn_*                                     # everything (not recommended)
+```
 
 So that nothing bypasses the proxy, the plugin moves Binary Ninja's server to a random free
 port with a random bearer token, both known only to the proxy: it sets `ui.mcp.port` and
@@ -233,14 +306,20 @@ All endpoints need the token (see [Security](#security)).
 
 - `GET /ping`.
 - `GET /run` → `{"running": <serialized run or null>, "queued": N, "parallel": [<run>, ...],
-  "parallel_queued": M, "max_parallel": K}`; each run has `session`, `name`, `label`,
-  `main_thread`, `parallel`, `timeout`, `state`, `running_for`, `cancel_requested`.
+  "parallel_queued": M, "max_parallel": K, "bndb": [{path, name}, ...]}`; each run has
+  `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `bndb`, `state`,
+  `running_for`, `cancel_requested`.
 - `GET /lock`: the lock, plus the same keys as `GET /run`.
-- `POST /run`: runs a script; takes `"timeout"` (seconds), `"run_id"` and `"parallel"`.
-  Answers 400 for parallel with main_thread/view, 409 for view/main_thread without the lock.
+- `POST /run`: runs a script; takes `"timeout"` (seconds), `"run_id"`, `"parallel"`,
+  `"bndb"` (path), `"args"` (list of str) and `"env"` (str→str). Answers 400 for parallel
+  with main_thread/view, bndb with view/main_thread/parallel, a bad `args`/`env` type or a
+  missing `--bndb` file; 409 for view/main_thread without the lock.
 - `POST /lock`, `POST /unlock`: take/renew and release the lock.
 - `POST /cancel {"session", "run_id", "force"}` → `"cancelled"` (the first run hit, the
   serialized one if any) and `"cancelled_runs"` (all).
+- `POST /bndb {"action": "save"|"close", "path"?}` → `{"ok", "action", "results": [{path,
+  ok, error?}]}` for the cached views (all when `path` is omitted); 404 when the path isn't
+  cached, 409 while a serialized script runs, 423 while another session holds the lock.
 
 ## Security
 
@@ -261,7 +340,9 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 `tests/test_bridge.py` covers `bridge_server.py` (bridge, lock, cancellation and timeouts
 including a fake main-thread runner, the parallel lane and its slot limit, the UI-view rules,
-the MCP proxy against a fake upstream), `bnrun` (including Ctrl-C/SIGTERM) and
+args/env forwarding, the `--bndb` cache with fake hooks, the MCP proxy against a fake upstream
+including the tool allowlist), `bnrun` (including Ctrl-C/SIGTERM and `--max-out`) and
 `mcp-session-header`, with a fake namespace and a fake home directory. The plugin glue
 (`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's
-MCP server) only runs inside Binary Ninja and is not covered.
+MCP server, the real `--bndb` open/save/close) only runs inside Binary Ninja and is not
+covered.

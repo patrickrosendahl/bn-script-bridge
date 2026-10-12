@@ -8,24 +8,45 @@ Script bridge endpoints (bearer token + localhost checks, see ScriptBridge):
 
     GET  /ping     {"ok": true}
     POST /run      {"code": str, "view": str?, "main_thread": bool?, "parallel": bool?,
+                    "bndb": str?, "args": [str, ...]?, "env": {str: str}?,
                     "session": str?, "timeout": seconds?, "run_id": str?}
                    -> {"ok", "stdout", "result", "error"}; 423 while locked by another session;
-                   400 for parallel + main_thread / parallel + view; 409 for view or main_thread
-                   without holding the usage lock (see "UI views" below).
+                   400 for parallel + main_thread / parallel + view / bndb + view, main_thread
+                   or parallel; 409 for view or main_thread without holding the usage lock
+                   (see "UI views" below).
                    A cancelled script answers error "cancelled" (plus "cancelled_by") with the
                    stdout captured so far.
+                   args is argv (argv[0] plus the script's arguments) and env extra environment
+                   variables; serialized runs also swap them into sys.argv / os.environ for the
+                   duration of the script (restored after; parallel runs overlap, so they only
+                   get the bare `argv` / `env` names in their namespace). bndb opens that
+                   database headlessly, caches the view and runs the script with it as `bv`
+                   (serialized lane, no usage lock needed; see "bndb cache" below).
     GET  /run      {"ok", "running": serialized script status or null, "queued": int,
-                    "parallel": [status, ...], "parallel_queued": int, "max_parallel": int}
+                    "parallel": [status, ...], "parallel_queued": int, "max_parallel": int,
+                    "bndb": [cached view status, ...]}
     POST /cancel   {"session": str?, "run_id": str?, "force": bool?} cancel running scripts
                    (or, with run_id, that run even if still queued); 409 if nothing to cancel,
                    403 if not allowed (see ScriptBridge.cancel)
     GET  /lock     lock status (+ the keys of GET /run)
+    POST /bndb     {"action": "save"|"close", "path": str?} save or close cached views
+                   (all of them when path is omitted); 404 when that path isn't cached,
+                   409 while a serialized script runs, 423 while locked by another session
 
 Two lanes: serialized scripts (the default) run one at a time behind run_mutex; parallel
 scripts ("parallel": true) don't take run_mutex and run concurrently with the serialized one
 and with each other, at most max_parallel at once (more wait for a slot). Each script runs in
 its own HTTP handler thread (or, with main_thread, on the main thread), so cancel/timeout target
 that thread only. Parallel is for scripts that only create, analyse and close their own views.
+
+bndb cache: a "bndb" run opens that file headlessly (any openable path -- a .bndb opens its
+database, a raw binary is analysed once), caches the view and gives it to the script as `bv`.
+It runs in the serialized lane (cached views are shared between runs, so they must not overlap)
+but needs no usage lock: it touches no UI view. The plugin supplies the open/save/close hooks;
+bndb_open is only called with the lane held, so at most one opener at a time, and save/close is
+refused while a serialized script runs (see ScriptBridge._bndb_view for the ordering caveats).
+`bvs` stays a NoUIViews placeholder: it means the UI views everywhere else, and a --bndb run
+doesn't get them.
 
 UI views: the namespace's `bv`/`bvs` (the views open in the UI) are only provided to a
 serialized script whose session holds the usage lock. Otherwise they are NoUIViews placeholders
@@ -65,12 +86,15 @@ leaks into whatever the thread (e.g. Binary Ninja's main thread) runs next.
 """
 
 import ctypes
+import fnmatch
 import hmac
 import http.client
 import http.server
 import io
 import json
+import os
 import secrets
+import sys
 import threading
 import time
 import traceback
@@ -138,6 +162,13 @@ NEED_LOCK = ("UI views (bv, bvs, --view, --main-thread) need the usage lock; tak
              "no lock)")
 PARALLEL_NO_UI = ("parallel scripts get no UI views (bv, bvs, --view); UI work goes through "
                   "the serialized lane: run without --parallel while holding the usage lock")
+BNDB_NO_UI = ("--bndb runs headless on one cached view in the serialized lane: it can't be "
+              "combined with --view, --main-thread or --parallel; no usage lock needed")
+BNDB_BVS = ("`bvs` is not available for --bndb runs: they get one cached headless view as "
+            "`bv`; the UI views (bv/bvs of the open tabs) need the serialized lane with the "
+            "usage lock (bnrun --lock)")
+BNDB_NO_HOOKS = ("cached --bndb views aren't available: the plugin didn't register its "
+                 "open/save/close hooks (restart Binary Ninja with the current plugin)")
 
 
 _set_async_exc_fn = None
@@ -196,6 +227,31 @@ def run_script(code: str, namespace: Dict[str, Any],
     except BaseException:  # noqa: BLE001 -- report everything, including SystemExit
         return {"ok": False, "stdout": out.getvalue(), "result": None,
                 "error": traceback.format_exc()}
+
+
+def _install_globals(args: Optional[List[str]],
+                     env: Optional[Dict[str, str]]) -> Callable[[], None]:
+    """Serialized runs only (the lane is mutually exclusive): make `import sys` / `import os`
+    inside the script see the forwarded argv/env. Namespace injection can't -- `import sys`
+    fetches the real module from sys.modules. os.environ is updated, not replaced, so the
+    script keeps the rest of Binary Ninja's environment. Returns the restore closure."""
+    saved_argv = sys.argv
+    if args:
+        sys.argv = list(args)
+    changed = {}
+    for key, value in (env or {}).items():
+        changed[key] = os.environ.get(key)       # None: the key was absent
+        os.environ[key] = value
+
+    def restore():
+        sys.argv = saved_argv
+        for key, old in changed.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    return restore
 
 
 class UsageLock:
@@ -318,13 +374,18 @@ class Run:
     that was sent (see ScriptBridge._run_guarded)."""
 
     def __init__(self, code: str, session: Optional[str], name: str, main_thread: bool,
-                 timeout: Optional[float], run_id: str, parallel: bool = False):
+                 timeout: Optional[float], run_id: str, parallel: bool = False,
+                 args: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None,
+                 bndb: Optional[str] = None):
         self.run_id = run_id
         self.session = session
         self.name = name
         self.label = _label(code)
         self.main_thread = main_thread
         self.parallel = parallel
+        self.args = args
+        self.env = env
+        self.bndb = bndb
         self.finished = False
         self.timeout = timeout
         self.queued_at = time.time()
@@ -340,7 +401,7 @@ class Run:
         now = time.time()
         return {"session": self.session, "name": self.name, "label": self.label,
                 "main_thread": self.main_thread, "parallel": self.parallel,
-                "timeout": self.timeout,
+                "timeout": self.timeout, "bndb": self.bndb,
                 "state": "running" if self.started else "starting",
                 "running_for": int(now - self.started) if self.started else 0,
                 "cancel_requested": self.cancel_by}
@@ -351,6 +412,8 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         return "no script running"
     who = status.get("name") or (status.get("session") or "")[:8] or "no session"
     extra = [who]
+    if status.get("bndb"):
+        extra.append("bndb %s" % os.path.basename(status["bndb"]))
     if status.get("parallel"):
         extra.append("parallel")
     if status.get("main_thread"):
@@ -365,13 +428,16 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
 
 def describe_runs(reply: Dict[str, Any]) -> str:
     """All running scripts of a GET /run (or /lock) reply, one per line; "no script running"
-    only when nothing runs or waits in either lane."""
+    whenever nothing runs or waits in either lane (cached views add a line of their own)."""
     runs = ([reply["running"]] if reply.get("running") else []) + list(reply.get("parallel") or [])
-    lines = [describe_run(r) for r in runs]
+    lines = [describe_run(r) for r in runs] or [describe_run(None)]
     queued, pqueued = reply.get("queued") or 0, reply.get("parallel_queued") or 0
     if queued or pqueued:
         lines.append("queued: %d serialized, %d parallel" % (queued, pqueued))
-    return "\n".join(lines) or describe_run(None)
+    cached = [v.get("name") for v in reply.get("bndb") or []]
+    if cached:
+        lines.append("cached views: %s" % ", ".join(cached))
+    return "\n".join(lines)
 
 
 def _localhost_only(handler: http.server.BaseHTTPRequestHandler) -> Optional[str]:
@@ -402,16 +468,27 @@ class ScriptBridge:
                  main_thread_runner: Optional[MainThreadRunner] = None, port: int = 0,
                  lock: Optional[UsageLock] = None,
                  max_parallel: Union[int, Callable[[], int]] = DEFAULT_MAX_PARALLEL,
-                 base_namespace: Optional[Dict[str, Any]] = None):
+                 base_namespace: Optional[Dict[str, Any]] = None,
+                 bndb_open: Optional[Callable[[str], Any]] = None,
+                 bndb_save: Optional[Callable[[Any], bool]] = None,
+                 bndb_close: Optional[Callable[[Any], None]] = None):
         """namespace_factory(view) gives the UI views (bv, bvs, ...) and is only called for
         scripts allowed to use them; base_namespace (e.g. the binaryninja module) is what every
-        script gets. max_parallel: int, or a callable read whenever a parallel script waits."""
+        script gets. max_parallel: int, or a callable read whenever a parallel script waits.
+        bndb_open/bndb_save/bndb_close are the plugin's hooks for the cached headless views
+        (open a path -> view or None, save a view -> bool, close a view); None disables
+        the --bndb cache (see the module docstring)."""
         self.token = token
         self.namespace_factory = namespace_factory
         self.base_namespace = dict(base_namespace or {})
         self.main_thread_runner = main_thread_runner or (lambda fn: fn())
         self.lock = lock or UsageLock()
         self.max_parallel = max_parallel
+        self.bndb_open = bndb_open
+        self.bndb_save = bndb_save
+        self.bndb_close = bndb_close
+        self.bndb_mutex = threading.Lock()
+        self.bndb_views: Dict[str, Any] = {}    # abspath -> cached view handle
         self.run_mutex = threading.Lock()    # serialized lane: one script at a time
         self.state = threading.Lock()        # guards current, queued, parallel*, cancelled_ids
         self.slot_free = threading.Condition(self.state)   # a parallel slot or cancel happened
@@ -469,7 +546,7 @@ class ScriptBridge:
                 reason = self._refused()
                 if reason:
                     return _reply_json(self, 403, {"ok": False, "error": reason})
-                if self.path not in ("/run", "/lock", "/unlock", "/cancel"):
+                if self.path not in ("/run", "/lock", "/unlock", "/cancel", "/bndb"):
                     return _reply_json(self, 404, {"ok": False, "error": "not found"})
                 req = self._body()
                 if req is None:
@@ -478,6 +555,8 @@ class ScriptBridge:
                     return self._lock(req)
                 if self.path == "/unlock":
                     return self._unlock(req)
+                if self.path == "/bndb":
+                    return self._bndb(req)
                 if self.path == "/cancel":
                     return _reply_json(self, *bridge.cancel(
                         req.get("session"), req.get("run_id"), bool(req.get("force"))))
@@ -487,11 +566,39 @@ class ScriptBridge:
                                                    "error": "bad request: code must be a string"})
                 view, main_thread = req.get("view"), bool(req.get("main_thread"))
                 parallel = bool(req.get("parallel"))
+                bndb = req.get("bndb")
                 if parallel and (main_thread or view):
                     return _reply_json(self, 400, {"ok": False, "error": "bad request: "
                                                    + ("parallel scripts can't run on the main "
                                                       "thread (--parallel with --main-thread)"
                                                       if main_thread else PARALLEL_NO_UI)})
+                if bndb is not None:
+                    # bndb runs use their own cached headless view: no UI, serialized only
+                    # (cached views are shared, so runs using them must not overlap).
+                    if not isinstance(bndb, str) or not bndb.strip():
+                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
+                                                       "bndb must be a path string"})
+                    if view or main_thread or parallel:
+                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
+                                                       + BNDB_NO_UI})
+                    if not os.path.isfile(bndb):
+                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
+                                                       "--bndb file not found: %s" % bndb})
+                    if bridge.bndb_open is None:
+                        return _reply_json(self, 400, {"ok": False, "error": BNDB_NO_HOOKS})
+                args = req.get("args")
+                if args is not None and (not isinstance(args, list)
+                                         or not all(isinstance(a, str) for a in args)):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: args "
+                                                   "must be a list of strings (argv[0] plus "
+                                                   "the script's arguments)"})
+                env = req.get("env")
+                if env is not None and (not isinstance(env, dict)
+                                        or not all(isinstance(k, str) and isinstance(v, str)
+                                                   for k, v in env.items())):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: env "
+                                                   "must be an object mapping names to string "
+                                                   "values"})
                 allowed, status = bridge.lock.check_use(req.get("session"))
                 if not allowed:
                     return _reply_json(self, 423, {"ok": False, "lock": status,
@@ -508,7 +615,8 @@ class ScriptBridge:
                 reply = bridge.execute(code, view, main_thread,
                                        session=req.get("session"), timeout=timeout,
                                        run_id=run_id if isinstance(run_id, str) else None,
-                                       name=str(req.get("name") or ""), parallel=parallel)
+                                       name=str(req.get("name") or ""), parallel=parallel,
+                                       args=args, env=env, bndb=bndb)
                 try:
                     _reply_json(self, 200, reply)
                 except (BrokenPipeError, ConnectionResetError):
@@ -538,6 +646,33 @@ class ScriptBridge:
                                                             + describe(status)})
                 _reply_json(self, 200, {"ok": True, "released": status})
 
+            def _bndb(self, req):
+                action = req.get("action")
+                if action not in ("save", "close"):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: action "
+                                                   'must be "save" or "close"'})
+                allowed, status = bridge.lock.check_use(req.get("session"))
+                if not allowed:
+                    return _reply_json(self, 423, {"ok": False, "lock": status,
+                                                   "error": "Binary Ninja is " + describe(status)})
+                if bridge.running() is not None:
+                    return _reply_json(self, 409, {"ok": False,
+                                                   "running": bridge.running(),
+                                                   "error": "a script is running; retry when "
+                                                            "it finishes"})
+                path = req.get("path")
+                if path is not None and not isinstance(path, str):
+                    return _reply_json(self, 400, {"ok": False, "error": "bad request: path "
+                                                   "must be a string"})
+                targets = bridge.bndb_paths(path)
+                if not targets and path is not None:
+                    return _reply_json(self, 404, {"ok": False, "error": "not cached: %s"
+                                                   % path})
+                results = (bridge.bndb_save_views(targets) if action == "save"
+                           else bridge.bndb_close_views(targets))
+                _reply_json(self, 200, {"ok": all(r["ok"] for r in results),
+                                        "action": action, "results": results})
+
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self.port = self.httpd.server_address[1]
 
@@ -561,18 +696,23 @@ class ScriptBridge:
                     "queued": self.queued,
                     "parallel": [r.status() for r in self.parallel_runs],
                     "parallel_queued": self.parallel_queued,
-                    "max_parallel": self.limit()}
+                    "max_parallel": self.limit(),
+                    "bndb": self.bndb_status()}
 
     def execute(self, code: str, view: Optional[str], main_thread: bool,
                 session: Optional[str] = None, timeout: Optional[float] = None,
                 run_id: Optional[str] = None, name: str = "",
-                parallel: bool = False) -> Dict[str, Any]:
+                parallel: bool = False, args: Optional[List[str]] = None,
+                env: Optional[Dict[str, str]] = None,
+                bndb: Optional[str] = None) -> Dict[str, Any]:
         if parallel and main_thread:
             return {"ok": False, "stdout": "", "result": None,
                     "error": "parallel scripts can't run on the main thread"}
+        if bndb and (view or main_thread or parallel):
+            return {"ok": False, "stdout": "", "result": None, "error": BNDB_NO_UI}
         run = Run(code, session if isinstance(session, str) else None, name, main_thread,
                   float(timeout) if timeout else None, run_id or secrets.token_hex(16),
-                  parallel)
+                  parallel, args=args, env=env, bndb=bndb)
         if parallel:
             return self._execute_parallel(run, code, view)
         with self.state:
@@ -624,8 +764,12 @@ class ScriptBridge:
                 self.slot_free.notify_all()
 
     def _namespace(self, run: Run, view: Optional[str]) -> Dict[str, Any]:
-        """The script's globals: the UI views only for a serialized lock holder.
-        Raises LookupError (bad view filter) or UIViewsUnavailable (view not allowed)."""
+        """The script's globals: the UI views only for a serialized lock holder, or the cached
+        headless view for a bndb run. Raises LookupError (bad view filter, or the bndb couldn't
+        be opened) or UIViewsUnavailable (view not allowed)."""
+        if run.bndb:
+            return dict(self.base_namespace, bv=self._bndb_view(run.bndb),
+                        bvs=NoUIViews("bvs", BNDB_BVS))
         if run.parallel:
             reason = PARALLEL_NO_UI
         elif not self.lock.holds(run.session):
@@ -637,6 +781,91 @@ class ScriptBridge:
         return dict(self.base_namespace, bv=NoUIViews("bv", reason),
                     bvs=NoUIViews("bvs", reason))
 
+    def _bndb_view(self, path: str) -> Any:
+        """The cached headless view for `path`, opening it if needed.
+
+        The open runs outside bndb_mutex (it can take minutes), which is safe because bndb runs
+        execute only in the serialized lane (enforced by the combo checks in the handler, in
+        execute and in bnrun): at most one opener, and management save/close is refused while a
+        serialized script runs. A close that passed that 409 gate just before a queued bndb run
+        starts can miss the run's newly opened view -- harmless, the entry stays cached."""
+        key = os.path.abspath(path)
+        with self.bndb_mutex:
+            if key in self.bndb_views:
+                return self.bndb_views[key]
+        try:
+            handle = self.bndb_open(key) if self.bndb_open else None
+        except Exception as e:  # noqa: BLE001 -- report the open failure, don't kill the thread
+            raise LookupError("couldn't open %s: %r" % (key, e)) from e
+        if handle is None:
+            raise LookupError("couldn't open %s" % key)
+        with self.bndb_mutex:
+            self.bndb_views[key] = handle
+        return handle
+
+    def bndb_status(self) -> List[Dict[str, Any]]:
+        """The cached headless views, for GET /run."""
+        with self.bndb_mutex:
+            return [{"path": path, "name": os.path.basename(path)}
+                    for path in sorted(self.bndb_views)]
+
+    def bndb_paths(self, path: Optional[str]) -> List[str]:
+        """Cached abspaths matching `path` (None = all; no match = empty)."""
+        with self.bndb_mutex:
+            if path is None:
+                return list(self.bndb_views)
+            return [p for p in self.bndb_views if p == os.path.abspath(path)]
+
+    def bndb_save_views(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """Save each cached view; per-entry errors are reported, not raised."""
+        results = []
+        for path in paths:
+            with self.bndb_mutex:
+                handle = self.bndb_views.get(path)
+            if handle is None:
+                results.append({"path": path, "ok": False, "error": "not cached"})
+                continue
+            try:
+                ok = bool(self.bndb_save(handle))
+            except Exception as e:  # noqa: BLE001 -- report, don't fail the others
+                results.append({"path": path, "ok": False, "error": repr(e)})
+                continue
+            results.append({"path": path, "ok": True} if ok
+                           else {"path": path, "ok": False, "error": "save failed"})
+        return results
+
+    def bndb_close_views(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """Close each cached view (close exceptions are ignored) and drop it from the cache."""
+        results = []
+        for path in paths:
+            with self.bndb_mutex:
+                handle = self.bndb_views.get(path)
+            if handle is None:
+                results.append({"path": path, "ok": False, "error": "not cached"})
+                continue
+            try:
+                if self.bndb_close:
+                    self.bndb_close(handle)
+                ok = True
+            except Exception:  # noqa: BLE001 -- a close failure still drops the entry
+                ok = True
+            with self.bndb_mutex:
+                self.bndb_views.pop(path, None)
+            results.append({"path": path, "ok": ok})
+        return results
+
+    def bndb_close_all(self) -> None:
+        """Close every cached view (used by stop()); close failures are ignored."""
+        with self.bndb_mutex:
+            views = list(self.bndb_views.items())
+            self.bndb_views.clear()
+        for _path, handle in views:
+            try:
+                if self.bndb_close:
+                    self.bndb_close(handle)
+            except Exception:  # noqa: BLE001 -- stopping anyway
+                pass
+
     def _execute_run(self, run: Run, code: str, view: Optional[str]) -> Dict[str, Any]:
         """Run a script that holds its lane (run_mutex or a parallel slot)."""
         if run.cancel_by is not None:
@@ -645,6 +874,10 @@ class ScriptBridge:
             namespace = self._namespace(run, view)
         except (LookupError, UIViewsUnavailable) as e:
             return {"ok": False, "stdout": "", "result": None, "error": str(e)}
+        # Bare names for every run (race-free); parallel runs don't get the sys.argv /
+        # os.environ swap below -- they overlap, so a global swap would corrupt it.
+        namespace["argv"] = list(run.args or [])
+        namespace["env"] = dict(run.env or {})
         box: Dict[str, Any] = {}
 
         def job():
@@ -667,6 +900,7 @@ class ScriptBridge:
         result: Optional[Dict[str, Any]] = None
         begun = False
         while True:     # a late ScriptCancelled may hit this bookkeeping: redo it until clean
+            restore: Optional[Callable[[], None]] = None
             try:
                 if not begun:
                     begun = True
@@ -679,6 +913,10 @@ class ScriptBridge:
                         run.timer = threading.Timer(run.timeout, self._on_timeout, (run,))
                         run.timer.daemon = True
                         run.timer.start()
+                    if not run.parallel and (run.args or run.env):
+                        # Serialized only: the lane is mutually exclusive, so the process-global
+                        # sys.argv / os.environ swap can't collide with another run.
+                        restore = _install_globals(run.args, run.env)
                     result = run_script(code, namespace, out)
                 run.executing = False
                 while run.sending:          # a canceller is deciding: wait for its verdict
@@ -688,6 +926,9 @@ class ScriptBridge:
                 break
             except ScriptCancelled:
                 continue
+            finally:
+                if restore is not None:
+                    restore()
         if run.cancel_by is not None and (result is None or result.get("error") == "cancelled"):
             return self._cancelled(run, out.getvalue())
         return result if result is not None else self._cancelled(run, out.getvalue())
@@ -814,6 +1055,56 @@ OWNER_TOOLS = [
 ]
 OWNER_TOOL_NAMES = {t["name"] for t in OWNER_TOOLS}
 
+# bn_open_item_open is answered by the proxy when the plugin's open_guard rejects the path
+# (a .bndb opened twice gets two database handles, and then saves fail on both lanes).
+OPEN_TOOL_NAME = "bn_open_item_open"
+
+# The default scriptbridge.mcpTools allowlist: comma-separated fnmatch globs over the tool
+# names of Binary Ninja's MCP server. Empty means no filter (every upstream tool passes).
+# Curated for the interactive RE loop (decompile, xrefs, rename, search, lists) -- see the
+# skill for the bnrun alternative for everything else. Owner tools always pass.
+DEFAULT_MCP_TOOLS = ",".join([
+    "bn_analysis_status",
+    "bn_binary_view_info",
+    "bn_binary_view_list",
+    "bn_binary_view_get_active",
+    "bn_comment_set",
+    "bn_data_variable_list",
+    "bn_function_callees",
+    "bn_function_callers",
+    "bn_function_decompile",
+    "bn_function_disassembly",
+    "bn_function_il",
+    "bn_function_info",
+    "bn_function_list",
+    "bn_function_search",
+    "bn_function_xrefs_from",
+    "bn_function_xrefs_to",
+    "bn_memory_read",
+    "bn_open_item_list",
+    "bn_open_item_open",
+    "bn_open_item_save",
+    "bn_string_list",
+    "bn_symbol_list",
+    "bn_symbol_list_at",
+    "bn_symbol_rename",
+    "bn_type_info",
+    "bn_type_search",
+])
+TOOL_NOT_ALLOWED = "tool %s is not in the scriptbridge.mcpTools allowlist"
+
+
+def tool_allowed(name: str, patterns: Optional[Union[str, List[str]]]) -> bool:
+    """True if `name` matches the comma-separated (or list of) fnmatch globs; None or ""
+    means no filter. Owner tools always pass."""
+    if name in OWNER_TOOL_NAMES:
+        return True
+    if not patterns:
+        return True
+    if isinstance(patterns, str):
+        patterns = [p.strip() for p in patterns.split(",") if p.strip()]
+    return any(fnmatch.fnmatch(name, p) for p in patterns)
+
 
 def owner_tool(lock: UsageLock, session: Optional[str], name: str,
                args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
@@ -868,12 +1159,18 @@ def _is_tools_list(body: bytes) -> bool:
     return isinstance(message, dict) and message.get("method") == "tools/list"
 
 
-def add_owner_tools(message: Any) -> Any:
-    """A tools/list response with OWNER_TOOLS appended (other messages unchanged)."""
+def add_owner_tools(message: Any, patterns: Optional[Union[str, List[str]]] = None) -> Any:
+    """A tools/list response with the allowlist applied and OWNER_TOOLS appended (other
+    messages unchanged). Owner tools always pass the allowlist; upstream order is kept."""
     tools = ((message or {}).get("result") or {}).get("tools") if isinstance(message, dict) \
         else None
-    if isinstance(tools, list) and not any(t.get("name") in OWNER_TOOL_NAMES for t in tools):
-        tools.extend(OWNER_TOOLS)
+    if isinstance(tools, list):
+        if patterns is not None:
+            tools[:] = [t for t in tools
+                        if not isinstance(t, dict)
+                        or tool_allowed(t.get("name") or "", patterns)]
+        if not any(t.get("name") in OWNER_TOOL_NAMES for t in tools):
+            tools.extend(OWNER_TOOLS)
     return message
 
 
@@ -882,8 +1179,17 @@ class McpProxy:
 
     def __init__(self, lock: UsageLock, upstream_port: int, port: int = 0,
                  upstream_host: str = "127.0.0.1", timeout: float = 600.0,
-                 upstream_token: Optional[str] = None):
+                 upstream_token: Optional[str] = None,
+                 allowed_tools: Union[str, List[str], Callable[[], Union[str, List[str]]],
+                                      None] = None,
+                 open_guard: Optional[Callable[[str], Optional[str]]] = None):
         self.lock = lock
+        # Optional plugin hook for bn_open_item_open: open_guard(path) -> refusal message
+        # (answered by the proxy) or None to let the call through. The plugin uses it to
+        # keep one handle per file: a .bndb opened twice (cached --bndb view + MCP item,
+        # say) has two database handles, and then saves fail on both lanes until one of
+        # them closes without saving.
+        self.open_guard = open_guard
         # Where Binary Ninja's MCP server listens and its bearer token. The plugin moves that
         # server to a random port with a random token that only the proxy knows, so MCP
         # clients can't bypass the lock; clients' own Authorization headers are dropped.
@@ -891,7 +1197,17 @@ class McpProxy:
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
         self.upstream_token = upstream_token
+        # The scriptbridge.mcpTools allowlist (see tool_allowed): globs, or a callable
+        # returning them, read live for every tools/list and tools/call.
+        self.allowed_tools = allowed_tools
         proxy = self
+
+        def _patterns() -> Optional[Union[str, List[str]]]:
+            value = proxy.allowed_tools() if callable(proxy.allowed_tools) \
+                else proxy.allowed_tools
+            return value if value else None   # "" -> no filter
+
+        self._patterns = _patterns
 
         class Handler(http.server.BaseHTTPRequestHandler):
             server_version = "bn-mcp-proxy"
@@ -947,7 +1263,8 @@ class McpProxy:
                     conn.close()
 
             def _forward_tools_list(self, resp) -> None:
-                """Relay a tools/list reply (JSON or SSE) with OWNER_TOOLS appended."""
+                """Relay a tools/list reply (JSON or SSE) with the allowlist applied and
+                OWNER_TOOLS appended."""
                 data = resp.read()
                 ctype = resp.getheader("Content-Type") or ""
                 if "text/event-stream" in ctype:
@@ -955,10 +1272,11 @@ class McpProxy:
                     for i, line in enumerate(lines):
                         if line.startswith("data:"):
                             lines[i] = "data: " + json.dumps(add_owner_tools(
-                                json.loads(line[5:].strip())))
+                                json.loads(line[5:].strip()), proxy._patterns()))
                     data = "\n".join(lines).encode()
                 else:
-                    data = json.dumps(add_owner_tools(json.loads(data))).encode()
+                    data = json.dumps(add_owner_tools(json.loads(data),
+                                                      proxy._patterns())).encode()
                 self.send_response(resp.status, resp.reason)
                 for k, v in resp.getheaders():
                     if k.lower() not in _HOP_HEADERS:
@@ -1008,16 +1326,66 @@ class McpProxy:
                     "structuredContent": payload, "isError": not ok}})
                 return True
 
+            def _open_guard_call(self, message: Any) -> bool:
+                """Refuse bn_open_item_open calls the plugin's open_guard rejects. True
+                if the request was answered here (see McpProxy.__init__)."""
+                if proxy.open_guard is None or not _tool_calls(message):
+                    return False
+                items = message if isinstance(message, list) else [message]
+                refusals = []
+                for m in items:
+                    if not isinstance(m, dict):
+                        continue
+                    params = m.get("params") or {}
+                    if params.get("name") != OPEN_TOOL_NAME:
+                        continue
+                    path = (params.get("arguments") or {}).get("path")
+                    if not isinstance(path, str):
+                        continue
+                    refusal = proxy.open_guard(path)
+                    if refusal:
+                        refusals.append(str(refusal))
+                if not refusals:
+                    return False
+                reply = blocked_reply(message, "; ".join(dict.fromkeys(refusals)))
+                if reply is None:   # notifications only: nothing to answer
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    _reply_json(self, 200, reply)
+                return True
+
             def _gate(self, body: bytes) -> bool:
-                """True if the request was answered here (owner tools, or blocked by the lock)."""
+                """True if the request was answered here (owner tools, a filtered-out tool,
+                or blocked by the lock)."""
                 try:
                     message = json.loads(body)
                 except ValueError:
                     return False
                 if self._owner_call(message):
                     return True
+                if self._open_guard_call(message):
+                    return True
                 if not _tool_calls(message):
                     return False
+                patterns = proxy._patterns()
+                if patterns:
+                    items = message if isinstance(message, list) else [message]
+                    called = {str((m.get("params") or {}).get("name"))
+                              for m in items if isinstance(m, dict)}
+                    not_allowed = sorted(n for n in called
+                                         if n and not tool_allowed(n, patterns))
+                    if not_allowed:
+                        reply = blocked_reply(
+                            message, "; ".join(TOOL_NOT_ALLOWED % n for n in not_allowed))
+                        if reply is None:
+                            self.send_response(202)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                        else:
+                            _reply_json(self, 200, reply)
+                        return True
                 allowed, status = proxy.lock.check_use(self._session())
                 if allowed:
                     return False

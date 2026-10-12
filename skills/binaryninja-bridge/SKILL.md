@@ -5,14 +5,24 @@ description: Use whenever analysing a binary (ELF, Mach-O, PE, .class, firmware)
 
 # Binary Ninja via the `bnrun` script bridge
 
-`BNRUN=/Users/patrick/dev/bn-script-bridge/bnrun` (not on PATH; `bnrestart` beside it; setup notes in that repo's README) runs a Python script **inside the running Binary Ninja app** (Personal licence: no headless API) and returns its output. One script batches many tool calls.
+`BNRUN=/Users/patrick/rev/bn-script-bridge/bnrun` (not on PATH; `bnrestart` beside it; setup notes in that repo's README) runs a Python script **inside the running Binary Ninja app** (Personal licence: no headless API) and returns its output. One script batches many tool calls.
 
 ```sh
 $BNRUN --status                                # free / locked by <session>: <purpose>
 $BNRUN -e 'result = ...'                       # inline code (file or stdin too)
 ```
 
-In-script: `bv` (target view), `bvs` (all UI views), `bn`/`binaryninja` (API). `print()` output is returned; set `result` for structured output (JSON, else `repr`). Exit: 0 ok / 1 script error / 2 bridge refused or unreachable / 3 locked by another session / 130 interrupted.
+In-script: `bv` (target view), `bvs` (all UI views), `bn`/`binaryninja` (API), `argv`/`env` (from `-- ARGS` / `--env K=V`; serialized runs also get `sys.argv`/`os.environ`). `print()` output is returned; set `result` for structured output (JSON, else `repr`). Exit: 0 ok / 1 script error / 2 bridge refused or unreachable / 3 locked by another session / 130 interrupted.
+
+Parameterize instead of splicing strings: `$BNRUN dump.py -- 0x401000 50` → `int(argv[1], 16)`. Big output: `--max-out N` (full text goes to a file under `~/.cache/bn-script-bridge/`, path in the last line).
+
+## `--bndb` fast path (no lock, no re-analysis)
+```sh
+$BNRUN --bndb /path/target.bndb -e 'result = len(list(bv.functions))'
+$BNRUN --bndb-save            # write renames etc. into the .bndb -- after each batch of edits
+$BNRUN --bndb-list            # cached views (also in --status); --bndb-close frees them
+```
+Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no usage lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Details: `reference.md`.
 
 ## Usage lock (UI views are shared — take it before touching them)
 ```sh
