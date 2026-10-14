@@ -8,13 +8,23 @@ description: Use whenever analysing a binary (ELF, Mach-O, PE, .class, firmware)
 `BNRUN=/Users/patrick/dev/bn-script-bridge/bnrun` (not on PATH; `bnrestart` beside it; setup notes in that repo's README) runs a Python script **inside the running Binary Ninja app** (Personal licence: no headless API) and returns its output. One script batches many tool calls.
 
 ```sh
-$BNRUN --status                                # free / locked by <session>: <purpose>
+$BNRUN --status                                # free / locked by <session>: <purpose>; running/queued/lost jobs
+$BNRUN --status --json                         # same, machine-readable -- parse this, never the prose
 $BNRUN -e 'result = ...'                       # inline code (file or stdin too)
 ```
 
-In-script: `bv` (target view), `bvs` (all UI views), `bn`/`binaryninja` (API), `argv`/`env` (from `-- ARGS` / `--env K=V`; serialized runs also get `sys.argv`/`os.environ`). `print()` output is returned; set `result` for structured output (JSON, else `repr`). Exit: 0 ok / 1 script error / 2 bridge refused or unreachable / 3 locked by another session / 130 interrupted.
+In-script: `bv` (target view), `bvs` (all UI views), `bn`/`binaryninja` (API), `argv`/`env` (from `-- ARGS` / `--env K=V`; serialized runs also get `sys.argv`/`os.environ`). `print()` output is returned; set `result` for structured output (JSON, else `repr`). Exit: 0 ok / 1 script error / 2 bridge refused or unreachable / 3 locked by another session / 4 job lost / 130 interrupted.
 
 SCRIPT ending in `.py` is your file; anything else is a **bundled script** (next section). Scripts run inside Binary Ninja, whose cwd isn't yours: print and redirect, or pass absolute paths. Parameterize instead of splicing strings: `$BNRUN dump.py -- 0x401000 50` → `int(argv[1], 16)`. Big output: `--max-out N` (full text goes to a file under `~/.cache/bn-script-bridge/`, path in the last line).
+
+## Jobs: bnrun never abandons a submitted script
+Every run is a job: `bnrun` submits it, gets a run id and polls until it finishes -- no client timeout (also not while queued behind someone's long run); only `--timeout N` (counted from the script's start) stops it. Bridge briefly unreachable → it retries for 5 min, then exits 2 printing the run id. **Don't resubmit a batch whose bnrun died -- find its job instead** (resubmitting double-applies):
+```sh
+$BNRUN --detach --bndb $DB annotate -- R:...   # prints the run id, returns at once (long/big batches)
+$BNRUN --wait RUN_ID                           # output + exit status of that job (Ctrl-C only stops waiting)
+$BNRUN --jobs                                  # this session's jobs (full run ids, done ones for 1 h) + lost ones
+```
+**Lost jobs** (BN force-quit/crashed/Stopped while they were queued or running) stay on disk, shown as `lost: N` in `--status`; `--wait` on one exits 4. Nothing reruns on its own: `--requeue RUN_ID|all` reruns never-started ones (and waits); a job that was *running* needs `--force` -- check first, it may be half-applied or be what wedged BN. `--forget RUN_ID|all` drops them.
 
 ## `--bndb` fast path (no lock, no re-analysis)
 ```sh

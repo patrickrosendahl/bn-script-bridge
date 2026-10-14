@@ -24,7 +24,8 @@ Script bridge endpoints (bearer token + localhost checks, see ScriptBridge):
                    (serialized lane, no usage lock needed; see "bndb cache" below).
     GET  /run      {"ok", "running": serialized script status or null, "queued": int,
                     "parallel": [status, ...], "parallel_queued": int, "max_parallel": int,
-                    "bndb": [cached view status, ...]}
+                    "bndb": [cached view status, ...], "jobs": [unfinished job status, ...],
+                    "lost": int}
     POST /cancel   {"session": str?, "run_id": str?, "force": bool?} cancel running scripts
                    (or, with run_id, that run even if still queued); 409 if nothing to cancel,
                    403 if not allowed (see ScriptBridge.cancel)
@@ -32,6 +33,28 @@ Script bridge endpoints (bearer token + localhost checks, see ScriptBridge):
     POST /bndb     {"action": "save"|"close", "path": str?} save or close cached views
                    (all of them when path is omitted); 404 when that path isn't cached,
                    409 while a serialized script runs, 423 while locked by another session
+    POST /result   {"run_id": str, "wait": seconds?} the job's state, waiting up to "wait"
+                   (max 60) for it to finish: {"ok", "state": "queued"|"starting"|"running"|
+                   "done"|"lost", "run": status, "reply": the /run reply once done}; a lost job
+                   (see "Jobs") answers {"state": "lost", "lost": record}; 404 if unknown
+    POST /jobs     {"session": str?} {"ok", "jobs": [that session's jobs, with run_id],
+                   "lost": [every lost job, with run_id]}
+    POST /lost     {"action": "requeue"|"forget", "run_ids": [str, ...]|"all", "force": bool?,
+                   "session": str?, "name": str?} rerun (as new jobs of this session, same
+                   checks as /run) or drop lost jobs; one that was running when its bridge died
+                   is only requeued with force: it may have applied part of its edits, or be
+                   what wedged Binary Ninja
+
+Jobs: a /run with "async": true answers 202 {"ok", "run_id", "job", "state"} at once and runs
+the script in a thread of its own; the client polls POST /result (long poll) for the reply, so
+no HTTP request is held open for the whole run and a client timeout never abandons a job.
+Submitting a run_id the bridge already knows answers that job instead of running it again, so a
+client may resubmit after a lost connection without double-applying. Every run (async or not)
+is a job: finished ones keep their reply for /result for JOB_KEEP_SECONDS (at most JOB_KEEP).
+With a spool_dir, each job's request is written there while it is queued or running and
+removed when it finishes; jobs still spooled when a bridge starts (their Binary Ninja died or
+stopped first) become "lost": reported by GET /run ("lost": count), /jobs and /result, kept on
+disk until requeued or forgotten (POST /lost). Nothing is rerun on its own.
 
 Two lanes: serialized scripts (the default) run one at a time behind run_mutex; parallel
 scripts ("parallel": true) don't take run_mutex and run concurrently with the serialized one
@@ -93,6 +116,7 @@ import http.server
 import io
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -106,6 +130,14 @@ MAX_LOCK_TTL = 4 * 60 * 60
 SESSION_HEADER = "X-BN-Session"
 SESSION_NAME_HEADER = "X-BN-Session-Name"
 DEFAULT_MAX_PARALLEL = 4
+JOB_KEEP = 100                  # finished jobs whose reply /result still gives
+JOB_KEEP_SECONDS = 60 * 60
+MAX_RESULT_WAIT = 60
+RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# The request fields a job is spooled (and requeued) with.
+JOB_FIELDS = ("code", "view", "main_thread", "parallel", "bndb", "args", "env", "timeout")
+# run_ids of spooled jobs alive in this process: a Stop + Start must not call them lost.
+_LIVE_RUN_IDS: set = set()
 
 # namespace_factory(view_filter) -> dict of globals for the script; raises LookupError when
 # the requested view isn't open.
@@ -389,6 +421,7 @@ class Run:
         self.run_id = run_id
         self.session = session
         self.name = name
+        self.code = code
         self.label = _label(code)
         self.main_thread = main_thread
         self.parallel = parallel
@@ -405,15 +438,37 @@ class Run:
         self.exc_sent = False
         self.cancel_by: Optional[str] = None
         self.timer: Optional[threading.Timer] = None
+        self.request: Dict[str, Any] = {}      # JOB_FIELDS, for the spool
+        self.in_lane = False                    # holds run_mutex or a parallel slot
+        self.reply: Optional[Dict[str, Any]] = None
+        self.done = threading.Event()
+        self.finished_at: Optional[float] = None
 
-    def status(self) -> Dict[str, Any]:
+    def state_name(self) -> str:
+        if self.reply is not None:
+            return "done"
+        if not self.in_lane:
+            return "queued"
+        return "running" if self.started else "starting"
+
+    def status(self, full: bool = False) -> Dict[str, Any]:
+        """full adds the run_id (which lets anyone cancel the run or fetch its reply)."""
         now = time.time()
-        return {"session": self.session, "name": self.name, "label": self.label,
-                "main_thread": self.main_thread, "parallel": self.parallel,
-                "timeout": self.timeout, "bndb": self.bndb,
-                "state": "running" if self.started else "starting",
-                "running_for": int(now - self.started) if self.started else 0,
-                "cancel_requested": self.cancel_by}
+        status = {"session": self.session, "name": self.name, "label": self.label,
+                  "main_thread": self.main_thread, "parallel": self.parallel,
+                  "timeout": self.timeout, "bndb": self.bndb, "job": self.run_id[:8],
+                  "state": self.state_name(),
+                  "queued_for": int((self.started or now) - self.queued_at),
+                  "running_for": int((self.finished_at or now) - self.started)
+                  if self.started else 0,
+                  "cancel_requested": self.cancel_by}
+        if full:
+            status["run_id"] = self.run_id
+            if self.reply is not None:
+                status["ok"] = bool(self.reply.get("ok"))
+                status["error"] = self.reply.get("error")
+                status["finished_ago"] = int(now - (self.finished_at or now))
+        return status
 
 
 def describe_run(status: Optional[Dict[str, Any]]) -> str:
@@ -421,8 +476,10 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         return "no script running"
     who = status.get("name") or (status.get("session") or "")[:8] or "no session"
     extra = [who]
+    if status.get("job"):
+        extra.append("job %s" % status["job"])
     if status.get("bndb"):
-        extra.append("bndb %s" % os.path.basename(status["bndb"]))
+        extra.append("bndb %s" % status["bndb"])
     if status.get("parallel"):
         extra.append("parallel")
     if status.get("main_thread"):
@@ -431,18 +488,40 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         extra.append("timeout %gs" % status["timeout"])
     if status.get("cancel_requested"):
         extra.append("cancel requested: %s" % status["cancel_requested"])
+    if status.get("state") == "queued":
+        return "queued script %r for %ds (%s)" % (status["label"], status.get("queued_for", 0),
+                                                  ", ".join(extra))
     return "running script %r for %ds (%s)" % (status["label"], status["running_for"],
                                                ", ".join(extra))
 
 
+def describe_lost(record: Dict[str, Any]) -> str:
+    who = record.get("name") or (record.get("session") or "")[:8] or "no session"
+    extra = [who]
+    if (record.get("request") or {}).get("bndb"):
+        extra.append("bndb %s" % record["request"]["bndb"])
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(record.get("submitted_at") or 0))
+    return "lost script %r (was %s; %s, submitted %s)" % (
+        record.get("label"), record.get("state"), ", ".join(extra), when)
+
+
 def describe_runs(reply: Dict[str, Any]) -> str:
-    """All running scripts of a GET /run (or /lock) reply, one per line; "no script running"
-    whenever nothing runs or waits in either lane (cached views add a line of their own)."""
+    """All running scripts of a GET /run (or /lock) reply, one per line, then the queued ones;
+    "no script running" only when nothing runs or waits in either lane (cached views and lost
+    jobs add lines of their own). For scripts: bnrun --status --json."""
     runs = ([reply["running"]] if reply.get("running") else []) + list(reply.get("parallel") or [])
-    lines = [describe_run(r) for r in runs] or [describe_run(None)]
     queued, pqueued = reply.get("queued") or 0, reply.get("parallel_queued") or 0
+    lines = [describe_run(r) for r in runs]
+    if not lines and not (queued or pqueued):
+        lines.append(describe_run(None))
     if queued or pqueued:
         lines.append("queued: %d serialized, %d parallel" % (queued, pqueued))
+        lines += ["  " + describe_run(r) for r in reply.get("jobs") or []
+                  if r.get("state") == "queued"]
+    if reply.get("lost"):
+        lines.append("lost: %d job%s whose Binary Ninja stopped before they finished "
+                     "(bnrun --jobs; --requeue ID|all, --forget ID|all)"
+                     % (reply["lost"], "" if reply["lost"] == 1 else "s"))
     cached = [v.get("name") for v in reply.get("bndb") or []]
     if cached:
         lines.append("cached views: %s" % ", ".join(cached))
@@ -480,13 +559,15 @@ class ScriptBridge:
                  base_namespace: Optional[Dict[str, Any]] = None,
                  bndb_open: Optional[Callable[[str], Any]] = None,
                  bndb_save: Optional[Callable[[Any], bool]] = None,
-                 bndb_close: Optional[Callable[[Any], None]] = None):
+                 bndb_close: Optional[Callable[[Any], None]] = None,
+                 spool_dir: Optional[str] = None):
         """namespace_factory(view) gives the UI views (bv, bvs, ...) and is only called for
         scripts allowed to use them; base_namespace (e.g. the binaryninja module) is what every
         script gets. max_parallel: int, or a callable read whenever a parallel script waits.
         bndb_open/bndb_save/bndb_close are the plugin's hooks for the cached headless views
         (open a path -> view or None, save a view -> bool, close a view); None disables
-        the --bndb cache (see the module docstring)."""
+        the --bndb cache (see the module docstring). spool_dir keeps queued and running jobs
+        on disk so the next bridge can report them as lost (None: no spool)."""
         self.token = token
         self.namespace_factory = namespace_factory
         self.base_namespace = dict(base_namespace or {})
@@ -506,6 +587,9 @@ class ScriptBridge:
         self.parallel_runs: List[Run] = []   # parallel runs holding a slot
         self.parallel_queued = 0             # parallel runs waiting for a slot
         self.cancelled_ids: Dict[str, str] = {}   # run_id -> by, for runs not started yet
+        self.jobs: Dict[str, Run] = {}       # run_id -> job, oldest first (guarded by state)
+        self.spool_dir = spool_dir
+        self.lost: Dict[str, Dict[str, Any]] = self._load_lost()   # run_id -> spool record
         bridge = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -543,7 +627,7 @@ class ScriptBridge:
                 if reason:
                     return _reply_json(self, 403, {"ok": False, "error": reason})
                 if self.path == "/ping":
-                    return _reply_json(self, 200, {"ok": True})
+                    return _reply_json(self, 200, {"ok": True, "jobs": True})
                 if self.path == "/lock":
                     return _reply_json(self, 200, dict(bridge.run_status(), ok=True,
                                                        lock=bridge.lock.status()))
@@ -555,7 +639,8 @@ class ScriptBridge:
                 reason = self._refused()
                 if reason:
                     return _reply_json(self, 403, {"ok": False, "error": reason})
-                if self.path not in ("/run", "/lock", "/unlock", "/cancel", "/bndb"):
+                if self.path not in ("/run", "/lock", "/unlock", "/cancel", "/bndb", "/result",
+                                     "/jobs", "/lost"):
                     return _reply_json(self, 404, {"ok": False, "error": "not found"})
                 req = self._body()
                 if req is None:
@@ -569,63 +654,21 @@ class ScriptBridge:
                 if self.path == "/cancel":
                     return _reply_json(self, *bridge.cancel(
                         req.get("session"), req.get("run_id"), bool(req.get("force"))))
-                code = req.get("code")
-                if not isinstance(code, str):
-                    return _reply_json(self, 400, {"ok": False,
-                                                   "error": "bad request: code must be a string"})
-                view, main_thread = req.get("view"), bool(req.get("main_thread"))
-                parallel = bool(req.get("parallel"))
-                bndb = req.get("bndb")
-                if parallel and (main_thread or view):
-                    return _reply_json(self, 400, {"ok": False, "error": "bad request: "
-                                                   + ("parallel scripts can't run on the main "
-                                                      "thread (--parallel with --main-thread)"
-                                                      if main_thread else PARALLEL_NO_UI)})
-                if bndb is not None:
-                    # bndb runs use their own cached headless view: no UI, serialized only
-                    # (cached views are shared, so runs using them must not overlap).
-                    if not isinstance(bndb, str) or not bndb.strip():
-                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
-                                                       "bndb must be a path string"})
-                    if view or main_thread or parallel:
-                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
-                                                       + BNDB_NO_UI})
-                    if not os.path.isfile(bndb):
-                        return _reply_json(self, 400, {"ok": False, "error": "bad request: "
-                                                       "--bndb file not found: %s" % bndb})
-                    if bridge.bndb_open is None:
-                        return _reply_json(self, 400, {"ok": False, "error": BNDB_NO_HOOKS})
-                args = req.get("args")
-                if args is not None and (not isinstance(args, list)
-                                         or not all(isinstance(a, str) for a in args)):
-                    return _reply_json(self, 400, {"ok": False, "error": "bad request: args "
-                                                   "must be a list of strings (argv[0] plus "
-                                                   "the script's arguments)"})
-                env = req.get("env")
-                if env is not None and (not isinstance(env, dict)
-                                        or not all(isinstance(k, str) and isinstance(v, str)
-                                                   for k, v in env.items())):
-                    return _reply_json(self, 400, {"ok": False, "error": "bad request: env "
-                                                   "must be an object mapping names to string "
-                                                   "values"})
-                allowed, status = bridge.lock.check_use(req.get("session"))
-                if not allowed:
-                    return _reply_json(self, 423, {"ok": False, "lock": status,
-                                                   "error": "Binary Ninja is " + describe(status)})
-                if (view or main_thread) and not bridge.lock.holds(req.get("session")):
-                    return _reply_json(self, 409, {"ok": False, "lock": status,
-                                                   "error": NEED_LOCK})
-                timeout = req.get("timeout")
-                if timeout is not None and (isinstance(timeout, bool) or
-                                            not isinstance(timeout, (int, float)) or timeout <= 0):
-                    return _reply_json(self, 400, {"ok": False, "error": "bad request: timeout "
-                                                   "must be a positive number of seconds"})
-                run_id = req.get("run_id")
-                reply = bridge.execute(code, view, main_thread,
-                                       session=req.get("session"), timeout=timeout,
-                                       run_id=run_id if isinstance(run_id, str) else None,
-                                       name=str(req.get("name") or ""), parallel=parallel,
-                                       args=args, env=env, bndb=bndb)
+                if self.path == "/result":
+                    return _reply_json(self, *bridge.result(req.get("run_id"), req.get("wait")))
+                if self.path == "/jobs":
+                    return _reply_json(self, 200, bridge.jobs_of(req.get("session")))
+                if self.path == "/lost":
+                    return _reply_json(self, *bridge.lost_action(req))
+                refusal, params = bridge.check_run(req)
+                if refusal:
+                    return _reply_json(self, *refusal)
+                if req.get("async"):
+                    run = bridge.submit(params)
+                    return _reply_json(self, 202, {"ok": True, "run_id": run.run_id,
+                                                   "job": run.run_id[:8],
+                                                   "state": run.state_name()})
+                reply = bridge.execute(**params)
                 try:
                     _reply_json(self, 200, reply)
                 except (BrokenPipeError, ConnectionResetError):
@@ -685,6 +728,60 @@ class ScriptBridge:
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
         self.port = self.httpd.server_address[1]
 
+    def check_run(self, req: Dict[str, Any]) -> Tuple[Optional[Tuple[int, Dict[str, Any]]],
+                                                      Dict[str, Any]]:
+        """(refusal as (HTTP status, reply) or None, execute()'s keyword arguments) for a /run
+        request (also used to requeue a lost job)."""
+        def bad(text, status=400, **extra):
+            return (status, dict({"ok": False, "error": text}, **extra)), {}
+        code = req.get("code")
+        if not isinstance(code, str):
+            return bad("bad request: code must be a string")
+        view, main_thread = req.get("view"), bool(req.get("main_thread"))
+        parallel = bool(req.get("parallel"))
+        bndb = req.get("bndb")
+        if parallel and (main_thread or view):
+            return bad("bad request: " + ("parallel scripts can't run on the main thread "
+                                          "(--parallel with --main-thread)"
+                                          if main_thread else PARALLEL_NO_UI))
+        if bndb is not None:
+            # bndb runs use their own cached headless view: no UI, serialized only
+            # (cached views are shared, so runs using them must not overlap).
+            if not isinstance(bndb, str) or not bndb.strip():
+                return bad("bad request: bndb must be a path string")
+            if view or main_thread or parallel:
+                return bad("bad request: " + BNDB_NO_UI)
+            if not os.path.isfile(bndb):
+                return bad("bad request: --bndb file not found: %s" % bndb)
+            if self.bndb_open is None:
+                return bad(BNDB_NO_HOOKS)
+        args = req.get("args")
+        if args is not None and (not isinstance(args, list)
+                                 or not all(isinstance(a, str) for a in args)):
+            return bad("bad request: args must be a list of strings (argv[0] plus the "
+                       "script's arguments)")
+        env = req.get("env")
+        if env is not None and (not isinstance(env, dict)
+                                or not all(isinstance(k, str) and isinstance(v, str)
+                                           for k, v in env.items())):
+            return bad("bad request: env must be an object mapping names to string values")
+        allowed, status = self.lock.check_use(req.get("session"))
+        if not allowed:
+            return bad("Binary Ninja is " + describe(status), 423, lock=status)
+        if (view or main_thread) and not self.lock.holds(req.get("session")):
+            return bad(NEED_LOCK, 409, lock=status)
+        timeout = req.get("timeout")
+        if timeout is not None and (isinstance(timeout, bool) or
+                                    not isinstance(timeout, (int, float)) or timeout <= 0):
+            return bad("bad request: timeout must be a positive number of seconds")
+        run_id = req.get("run_id")
+        if run_id is not None and not (isinstance(run_id, str) and RUN_ID.fullmatch(run_id)):
+            return bad("bad request: run_id must be 1-64 letters, digits, - or _")
+        return None, {"code": code, "view": view, "main_thread": main_thread,
+                      "session": req.get("session"), "timeout": timeout, "run_id": run_id,
+                      "name": str(req.get("name") or ""), "parallel": parallel,
+                      "args": args, "env": env, "bndb": bndb}
+
     def running(self) -> Optional[Dict[str, Any]]:
         """Status of the serialized script being run (see Run.status), or None when idle."""
         with self.state:
@@ -706,7 +803,9 @@ class ScriptBridge:
                     "parallel": [r.status() for r in self.parallel_runs],
                     "parallel_queued": self.parallel_queued,
                     "max_parallel": self.limit(),
-                    "bndb": self.bndb_status()}
+                    "bndb": self.bndb_status(),
+                    "jobs": [r.status() for r in self.jobs.values() if r.reply is None],
+                    "lost": len(self.lost)}
 
     def execute(self, code: str, view: Optional[str], main_thread: bool,
                 session: Optional[str] = None, timeout: Optional[float] = None,
@@ -714,16 +813,78 @@ class ScriptBridge:
                 parallel: bool = False, args: Optional[List[str]] = None,
                 env: Optional[Dict[str, str]] = None,
                 bndb: Optional[str] = None) -> Dict[str, Any]:
+        """Run a script to its end and return the /run reply."""
         if parallel and main_thread:
             return {"ok": False, "stdout": "", "result": None,
                     "error": "parallel scripts can't run on the main thread"}
         if bndb and (view or main_thread or parallel):
             return {"ok": False, "stdout": "", "result": None, "error": BNDB_NO_UI}
-        run = Run(code, session if isinstance(session, str) else None, name, main_thread,
-                  float(timeout) if timeout else None, run_id or secrets.token_hex(16),
-                  parallel, args=args, env=env, bndb=bndb)
-        if parallel:
-            return self._execute_parallel(run, code, view)
+        run, _ = self._new_run(code, view, main_thread, session, timeout, run_id, name,
+                               parallel, args, env, bndb, reuse=False)
+        return self._drive(run)
+
+    def submit(self, params: Dict[str, Any]) -> Run:
+        """Start a job (execute()'s keyword arguments, checked by check_run) in a thread of its
+        own and return it at once; a run_id the bridge already knows returns that job."""
+        run, created = self._new_run(reuse=True, **params)
+        if created:
+            threading.Thread(target=self._drive, args=(run,), daemon=True,
+                             name="bn-script-bridge job %s" % run.run_id[:8]).start()
+        return run
+
+    def _new_run(self, code: str, view: Optional[str], main_thread: bool,
+                 session: Optional[str], timeout: Optional[float], run_id: Optional[str],
+                 name: str, parallel: bool, args: Optional[List[str]],
+                 env: Optional[Dict[str, str]], bndb: Optional[str],
+                 reuse: bool) -> Tuple[Run, bool]:
+        """(the job, whether it is new): registered and spooled; with reuse an existing job of
+        the same run_id is returned instead."""
+        with self.state:
+            if reuse and run_id in self.jobs:
+                return self.jobs[run_id], False
+            run = Run(code, session if isinstance(session, str) else None, name, main_thread,
+                      float(timeout) if timeout else None, run_id or secrets.token_hex(16),
+                      parallel, args=args, env=env, bndb=bndb)
+            run.request = {"code": code, "view": view, "main_thread": main_thread,
+                           "parallel": parallel, "bndb": bndb, "args": args, "env": env,
+                           "timeout": run.timeout}
+            self._prune_jobs()
+            self.jobs.pop(run.run_id, None)
+            self.jobs[run.run_id] = run
+        self._spool(run)
+        return run, True
+
+    def _prune_jobs(self) -> None:
+        """Drop finished jobs past JOB_KEEP_SECONDS or beyond the JOB_KEEP newest. Holds state."""
+        now = time.time()
+        finished = [r for r in self.jobs.values() if r.finished_at is not None]
+        for i, run in enumerate(finished):
+            if now - run.finished_at > JOB_KEEP_SECONDS or len(finished) - i > JOB_KEEP:
+                del self.jobs[run.run_id]
+
+    def _drive(self, run: Run) -> Dict[str, Any]:
+        """Run the job through its lane; record the reply, wake /result waiters, unspool."""
+        reply = None
+        try:
+            reply = (self._execute_parallel(run, run.request["view"]) if run.parallel
+                     else self._execute_serialized(run, run.request["view"]))
+            return reply
+        finally:
+            with self.state:
+                run.reply = reply if reply is not None else {
+                    "ok": False, "stdout": "", "result": None,
+                    "error": "the bridge failed to run the script (see Binary Ninja's log)"}
+                run.finished_at = time.time()
+            run.done.set()
+            self._unspool(run)
+
+    def _enter_lane(self, run: Run) -> None:
+        """Called with state held once the run holds its lane."""
+        run.in_lane = True
+        if run.run_id in self.cancelled_ids:
+            run.cancel_by = self.cancelled_ids.pop(run.run_id)
+
+    def _execute_serialized(self, run: Run, view: Optional[str]) -> Dict[str, Any]:
         with self.state:
             self.queued += 1
         waiting = True
@@ -733,10 +894,10 @@ class ScriptBridge:
                     self.queued -= 1
                     waiting = False
                     self.current = run
-                    if run.run_id in self.cancelled_ids:
-                        run.cancel_by = self.cancelled_ids.pop(run.run_id)
+                    self._enter_lane(run)
+                self._spool(run)
                 try:
-                    return self._execute_run(run, code, view)
+                    return self._execute_run(run, run.code, view)
                 finally:
                     if run.timer is not None:
                         run.timer.cancel()
@@ -748,7 +909,156 @@ class ScriptBridge:
                 with self.state:
                     self.queued -= 1
 
-    def _execute_parallel(self, run: Run, code: str, view: Optional[str]) -> Dict[str, Any]:
+    # -- job results, spool and lost jobs
+
+    def result(self, run_id: Any, wait: Any = None) -> Tuple[int, Dict[str, Any]]:
+        """POST /result: (HTTP status, reply) for a job, waiting up to `wait` seconds for it."""
+        if not isinstance(run_id, str):
+            return 400, {"ok": False, "error": "bad request: run_id must be a string"}
+        try:
+            wait = min(max(float(wait or 0), 0.0), MAX_RESULT_WAIT)
+        except (TypeError, ValueError):
+            return 400, {"ok": False, "error": "bad request: wait must be a number of seconds"}
+        with self.state:
+            run = self.jobs.get(run_id)
+            lost = self.lost.get(run_id)
+        if run is None:
+            if lost is not None:
+                return 200, {"ok": True, "state": "lost", "lost": self._lost_summary(lost)}
+            return 404, {"ok": False, "state": "unknown",
+                         "error": "no such job (unknown, or finished over %d minutes ago)"
+                                  % (JOB_KEEP_SECONDS // 60)}
+        run.done.wait(wait)
+        with self.state:
+            return 200, {"ok": True, "state": run.state_name(), "run": run.status(full=True),
+                         "reply": run.reply}
+
+    def jobs_of(self, session: Any) -> Dict[str, Any]:
+        """POST /jobs: this session's jobs and every lost one, with run_ids."""
+        session = session if isinstance(session, str) and session else None
+        with self.state:
+            jobs = [r.status(full=True) for r in self.jobs.values() if r.session == session]
+            lost = [self._lost_summary(rec) for rec in self.lost.values()]
+        return {"ok": True, "jobs": jobs, "lost": lost}
+
+    def lost_action(self, req: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        """POST /lost: requeue or forget lost jobs (see the module docstring)."""
+        action, ids = req.get("action"), req.get("run_ids")
+        if action not in ("requeue", "forget"):
+            return 400, {"ok": False, "error": 'bad request: action must be "requeue" or '
+                                               '"forget"'}
+        with self.state:
+            if ids == "all":
+                ids = list(self.lost)
+            elif not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
+                return 400, {"ok": False, "error": 'bad request: run_ids must be a list of '
+                                                   'strings or "all"'}
+            records = {i: self.lost.get(i) for i in ids}
+        results = []
+        for old_id, rec in records.items():
+            entry: Dict[str, Any] = {"run_id": old_id}
+            if rec is None:
+                entry.update(ok=False, error="not a lost job")
+            elif action == "forget":
+                self._drop_lost(old_id)
+                entry.update(ok=True)
+            elif rec.get("state") != "queued" and not req.get("force"):
+                entry.update(ok=False, error="was %s when its bridge died: it may have applied "
+                             "part of its edits (or be what wedged Binary Ninja); check, then "
+                             "requeue with force" % rec.get("state"))
+            else:
+                refusal, params = self.check_run(dict(rec.get("request") or {},
+                                                      session=req.get("session"),
+                                                      name=req.get("name") or rec.get("name")))
+                if refusal:
+                    entry.update(ok=False, status=refusal[0], error=refusal[1].get("error"))
+                else:
+                    self._drop_lost(old_id)
+                    run = self.submit(params)
+                    entry.update(ok=True, new_run_id=run.run_id, label=run.label)
+            results.append(entry)
+        return 200, {"ok": all(r["ok"] for r in results), "action": action,
+                     "results": results}
+
+    @staticmethod
+    def _lost_summary(rec: Dict[str, Any]) -> Dict[str, Any]:
+        out = {k: rec.get(k) for k in ("run_id", "state", "session", "name", "label",
+                                       "submitted_at", "started_at")}
+        out["request"] = {"bndb": (rec.get("request") or {}).get("bndb")}
+        return out
+
+    def _spool_file(self, run_id: str, lost: bool = False) -> str:
+        assert self.spool_dir and RUN_ID.fullmatch(run_id)
+        return os.path.join(self.spool_dir, "lost" if lost else "", run_id + ".json")
+
+    def _spool(self, run: Run) -> None:
+        """Write (or rewrite, once it is in its lane) the job's spool record."""
+        if not self.spool_dir or not RUN_ID.fullmatch(run.run_id) or run.reply is not None:
+            return
+        _LIVE_RUN_IDS.add(run.run_id)
+        record = {"run_id": run.run_id, "state": "running" if run.in_lane else "queued",
+                  "session": run.session, "name": run.name, "label": run.label,
+                  "submitted_at": run.queued_at, "started_at": time.time() if run.in_lane
+                  else None, "pid": os.getpid(), "request": run.request}
+        path = self._spool_file(run.run_id)
+        try:
+            os.makedirs(self.spool_dir, mode=0o700, exist_ok=True)
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(record, f)
+            os.replace(tmp, path)
+        except OSError:
+            pass    # the spool is best effort; the job runs anyway
+        if run.reply is not None:   # finished while being written
+            self._unspool(run)
+
+    def _unspool(self, run: Run) -> None:
+        _LIVE_RUN_IDS.discard(run.run_id)
+        if self.spool_dir and RUN_ID.fullmatch(run.run_id):
+            try:
+                os.remove(self._spool_file(run.run_id))
+            except OSError:
+                pass
+
+    def _load_lost(self) -> Dict[str, Dict[str, Any]]:
+        """Move the spool records no live job owns into lost/ and read them all."""
+        if not self.spool_dir:
+            return {}
+        lost_dir = os.path.join(self.spool_dir, "lost")
+        try:
+            os.makedirs(lost_dir, mode=0o700, exist_ok=True)
+            names = os.listdir(self.spool_dir)
+        except OSError:
+            return {}
+        for fname in names:
+            run_id = fname[:-5] if fname.endswith(".json") else None
+            if run_id and RUN_ID.fullmatch(run_id) and run_id not in _LIVE_RUN_IDS:
+                try:
+                    os.replace(os.path.join(self.spool_dir, fname),
+                               os.path.join(lost_dir, fname))
+                except OSError:
+                    pass
+        lost = {}
+        for fname in sorted(os.listdir(lost_dir)):
+            try:
+                with open(os.path.join(lost_dir, fname)) as f:
+                    rec = json.load(f)
+                if isinstance(rec, dict) and RUN_ID.fullmatch(str(rec.get("run_id"))):
+                    lost[rec["run_id"]] = rec
+            except (OSError, ValueError):
+                continue
+        return dict(sorted(lost.items(), key=lambda kv: kv[1].get("submitted_at") or 0))
+
+    def _drop_lost(self, run_id: str) -> None:
+        with self.state:
+            self.lost.pop(run_id, None)
+        try:
+            os.remove(self._spool_file(run_id, lost=True))
+        except OSError:
+            pass
+
+    def _execute_parallel(self, run: Run, view: Optional[str]) -> Dict[str, Any]:
         with self.state:
             self.parallel_queued += 1
             try:
@@ -762,8 +1072,10 @@ class ScriptBridge:
                 run.finished = True
                 return self._cancelled(run, "")
             self.parallel_runs.append(run)
+            self._enter_lane(run)
+        self._spool(run)
         try:
-            return self._execute_run(run, code, view)
+            return self._execute_run(run, run.code, view)
         finally:
             if run.timer is not None:
                 run.timer.cancel()

@@ -21,6 +21,7 @@ from binaryninja.mainthread import execute_on_main_thread, execute_on_main_threa
 from . import bridge_server
 
 CONFIG_NAME = "script_bridge.json"
+SPOOL_NAME = "script_bridge_spool"     # queued/running jobs, so a crash can't lose them silently
 _bridge = None
 _proxy = None
 
@@ -212,7 +213,12 @@ def start(*_args):
         token, _namespace, execute_on_main_thread_and_wait, lock=lock,
         max_parallel=lambda: Settings().get_integer("scriptbridge.maxParallel"),
         base_namespace={"binaryninja": binaryninja, "bn": binaryninja},
-        bndb_open=_bndb_open, bndb_save=_bndb_save, bndb_close=_bndb_close)
+        bndb_open=_bndb_open, bndb_save=_bndb_save, bndb_close=_bndb_close,
+        spool_dir=os.path.join(binaryninja.user_directory(), SPOOL_NAME))
+    if _bridge.lost:
+        log_warn("Script bridge: %d job(s) lost when Binary Ninja last stopped (never rerun on "
+                 "their own): bnrun --jobs, then --requeue ID|all or --forget ID|all"
+                 % len(_bridge.lost))
     try:
         settings = Settings()
         _proxy = bridge_server.McpProxy(lock, settings.get_integer("ui.mcp.port"),

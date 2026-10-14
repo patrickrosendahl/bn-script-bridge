@@ -174,7 +174,7 @@ Rules: `--bndb` runs in the serialized lane (cached views are shared, so runs us
 not overlap) but needs **no usage lock** — it touches no UI view — and can't be combined with
 `--view`, `--main-thread` or `--parallel`. `bvs` stays a placeholder that raises with the
 reason. The first open of a big `.bndb` takes a while (30k functions ≈ 85 s) — later runs are
-instant; `bnrun` uses a 10-minute HTTP timeout for `--bndb` runs. While another session holds
+instant; `bnrun` waits as long as the run takes (see [Jobs](#jobs)). While another session holds
 the lock, `--bndb` runs are refused like any other (exit 3).
 
 Management is refused (409) while a serialized script runs; `--bndb-save` of a raw binary
@@ -223,12 +223,41 @@ Writing your own: print errors (the bridge returns `print()` output, not `sys.st
 a failed run with `sys.exit("message")`. The bridge reports that as the error, with exit
 status 1 and no traceback; `sys.exit()` / `sys.exit(0)` count as success.
 
+## Jobs
+
+Every script is a job. `bnrun` submits it (`POST /run` with `"async": true`, answered at once
+with its run id) and then long-polls `POST /result` until it is done, so no HTTP request is held
+open for the whole run and there is no client-side timeout: a job queued behind a long run is
+never abandoned (only `--timeout`, counted from the script's start, stops one). If the bridge
+goes away while `bnrun` waits, it retries for 5 minutes -- picking up a restarted Binary Ninja's
+new port -- then exits 2 with the run id. Resubmitting a run id the bridge already knows answers
+that job instead of running it again.
+
+```sh
+bnrun --detach --bndb /abs/x.bndb annotate -- R:...   # print the run id and return at once
+bnrun --wait RUN_ID              # output and exit status of that job (Ctrl-C: stop waiting)
+bnrun --jobs                     # this session's jobs (done ones for an hour) and lost ones
+bnrun --requeue RUN_ID ...|all   # rerun lost jobs and wait (--force: also ones that were running)
+bnrun --forget RUN_ID ...|all    # drop lost jobs
+```
+
+The bridge spools each queued or running job to
+`~/Library/Application Support/Binary Ninja/script_bridge_spool/` (mode 0600) and removes it
+when it finishes. Jobs still there when the bridge next starts -- Binary Ninja crashed, was
+force-quit or stopped first -- are **lost**: reported in Binary Ninja's log, by `--status`
+(`lost: N jobs`), `--jobs`, and to a client waiting on one (`--wait` exits 4). None is rerun on
+its own; `--requeue` reruns them as new jobs of the calling session (same checks as a fresh
+run), and one that was already running needs `--force`: it may have applied part of its edits,
+or be what wedged Binary Ninja.
+
 ## Cancelling scripts
 
 ```sh
 bnrun --status                    # lock, one "running script '<first line>' for 42s (...)" line
-                                  # per running script (", parallel" marks that lane) and
-                                  # "queued: N serialized, M parallel"
+                                  # per running script (", parallel" marks that lane; "job
+                                  # <id>", full --bndb path), "queued: N serialized, M parallel"
+                                  # plus a line per queued job, and "lost: N jobs" if any
+bnrun --status --json             # the same as JSON: what scripts and watchers should parse
 bnrun --timeout 60 script.py      # the bridge cancels the script after 60 s of running
 bnrun --cancel                    # cancel this session's running scripts (both lanes)
 bnrun --cancel --force            # cancel all running scripts (also other sessions')
@@ -353,17 +382,29 @@ to the MCP connection id, and the session's own MCP calls then don't count as it
 
 All endpoints need the token (see [Security](#security)).
 
-- `GET /ping`.
+- `GET /ping` → `{"ok": true, "jobs": true}` (`jobs`: the bridge speaks the job protocol;
+  older bridges get one `/run` held open to the end).
 - `GET /run` → `{"running": <serialized run or null>, "queued": N, "parallel": [<run>, ...],
-  "parallel_queued": M, "max_parallel": K, "bndb": [{path, name}, ...]}`; each run has
-  `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `bndb`, `state`,
+  "parallel_queued": M, "max_parallel": K, "bndb": [{path, name}, ...], "jobs": [<run>, ...],
+  "lost": L}`; `jobs` are the unfinished runs (queued ones included), oldest first; each run
+  has `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `bndb`, `job` (first
+  8 characters of the run id), `state` (`queued`, `starting`, `running`), `queued_for`,
   `running_for`, `cancel_requested`.
 - `GET /lock`: the lock, plus the same keys as `GET /run`.
 - `POST /run`: runs a script (`sys.exit()` ends it: no status or 0 is success, a string is
   the `error`, another value `"script exited with status N"`); takes `"timeout"` (seconds), `"run_id"`, `"parallel"`,
   `"bndb"` (path), `"args"` (list of str) and `"env"` (str→str). Answers 400 for parallel
   with main_thread/view, bndb with view/main_thread/parallel, a bad `args`/`env` type or a
-  missing `--bndb` file; 409 for view/main_thread without the lock.
+  missing `--bndb` file or a `run_id` other than 1-64 of `[A-Za-z0-9_-]`; 409 for
+  view/main_thread without the lock. With `"async": true` it answers 202 `{"ok", "run_id",
+  "job", "state"}` at once (a known `run_id`: that job, not run again).
+- `POST /result {"run_id", "wait"?}` → `{"state", "run", "reply"}`, waiting up to `wait`
+  seconds (max 60) for the job; `reply` (the synchronous `/run` reply) once `state` is
+  `done`; `{"state": "lost", "lost": {...}}` for a lost job; 404 if unknown or expired.
+- `POST /jobs {"session"}` → `{"jobs": [that session's runs with run_id, ok, error,
+  finished_ago], "lost": [...]}`.
+- `POST /lost {"action": "requeue"|"forget", "run_ids": [...]|"all", "force"?, "session",
+  "name"?}` → `{"ok", "results": [{run_id, ok, error?, new_run_id?}]}`.
 - `POST /lock`, `POST /unlock`: take/renew and release the lock.
 - `POST /cancel {"session", "run_id", "force"}` → `"cancelled"` (the first run hit, the
   serialized one if any) and `"cancelled_runs"` (all).
@@ -390,7 +431,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 `tests/test_bridge.py` covers `bridge_server.py` (bridge, lock, cancellation and timeouts
 including a fake main-thread runner, the parallel lane and its slot limit, the UI-view rules,
-args/env forwarding, the `--bndb` cache with fake hooks, the MCP proxy against a fake upstream
+args/env forwarding, async jobs, the spool and lost-job requeue, the `--bndb` cache with fake hooks, the MCP proxy against a fake upstream
 including the tool allowlist), `bnrun` (including Ctrl-C/SIGTERM and `--max-out`), the
 bundled scripts and `bnannotate` against a fake BinaryView, and `mcp-session-header`, with a fake namespace and a fake home directory. The plugin glue
 (`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's

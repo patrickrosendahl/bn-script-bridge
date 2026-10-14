@@ -88,7 +88,7 @@ class BridgeFixture(unittest.TestCase):
 
 class BridgeTest(BridgeFixture):
     def test_ping(self):
-        self.assertEqual(self.request("GET", "/ping"), (200, {"ok": True}))
+        self.assertEqual(self.request("GET", "/ping"), (200, {"ok": True, "jobs": True}))
 
     def test_runs_script_with_stdout_and_result(self):
         self.hold_lock()
@@ -311,7 +311,8 @@ class CancelTest(BridgeFixture):
         self.assertEqual(self.request("GET", "/run")[1], {"ok": True, "running": None,
                                                           "queued": 0, "parallel": [],
                                                           "parallel_queued": 0,
-                                                          "max_parallel": 4, "bndb": []})
+                                                          "max_parallel": 4, "bndb": [],
+                                                          "jobs": [], "lost": 0})
         status, reply = self.request("POST", "/run", {"code": "result = sum(range(100000))"})
         self.assertEqual((status, reply["ok"], reply["result"]), (200, True, 4999950000))
 
@@ -320,7 +321,7 @@ class CancelTest(BridgeFixture):
         running = self.wait_running()
         self.assertEqual((running["label"], running["session"], running["name"]),
                          ("print('started')", "sess-fe", "fe"))
-        self.assertIn("running script \"print('started')\" for 0s (fe)",
+        self.assertIn("running script \"print('started')\" for 0s (fe, job %s)" % running["job"],
                       bridge_server.describe_run(running))
         self.assertEqual(self.request("GET", "/lock")[1]["running"]["label"], "print('started')")
         status, reply = self.request("POST", "/cancel", {"session": "sess-fe"})
@@ -564,8 +565,9 @@ class ParallelTest(BridgeFixture):
         self.assertTrue(all(r["parallel"] for r in status["parallel"]))
         r = self.bnrun("--status")
         self.assertEqual(r.stdout.count("running script \"print('started')\""), 2, r.stdout)
-        self.assertEqual(r.stdout.count(", parallel)"), 2, r.stdout)
-        self.assertIn("queued: 0 serialized, 1 parallel", r.stdout)
+        self.assertEqual(r.stdout.count(", parallel)"), 3, r.stdout)
+        self.assertIn("queued: 0 serialized, 1 parallel\n  queued script \"print('started')\"",
+                      r.stdout)
         self.assertNotIn("no script running", r.stdout)            # what bnrestart checks
         _, reply = self.request("POST", "/run", {"code": "result = 'serialized'"})
         self.assertEqual(reply["result"], "serialized")             # not stuck behind them
@@ -935,7 +937,7 @@ class BndbCacheTest(BridgeFixture):
         try:
             running = self.wait_running()
             self.assertEqual(running["bndb"], path)
-            self.assertIn("bndb target.bndb", bridge_server.describe_run(running))
+            self.assertIn("bndb %s" % path, bridge_server.describe_run(running))   # full path
         finally:
             self.request("POST", "/cancel", {"force": True})
             t.join(10)
@@ -1036,6 +1038,154 @@ class BndbCacheTest(BridgeFixture):
         self.assertEqual(r.returncode, 2)
         r = self.bnrun("--bndb", os.path.join(self.tmp.name, "missing.bndb"), "-e", "pass")
         self.assertEqual(r.returncode, 2)
+
+
+class JobsTest(BridgeFixture):
+    """Async jobs (/run async + /result), the spool, lost jobs and bnrun's job commands."""
+
+    def setUp(self):
+        super().setUp()
+        self.bridge.stop()
+        self.spool = os.path.join(self.tmp.name, "spool")
+        self.gate = threading.Event()
+        self.hits = []
+        self.bridge = self.make_bridge()
+        self.addCleanup(self.gate.set)
+
+    def make_bridge(self):
+        bridge = bridge_server.ScriptBridge(self.token, namespace, spool_dir=self.spool,
+                                            base_namespace={"gate": self.gate,
+                                                            "hits": self.hits})
+        bridge.start()
+        with open(self.config, "w") as f:
+            json.dump({"port": bridge.port, "token": self.token}, f)
+        return bridge
+
+    def crash_and_restart(self):
+        """A new bridge on the same spool, as if Binary Ninja had died: this process's jobs
+        no longer count as alive."""
+        self.bridge.stop()
+        bridge_server._LIVE_RUN_IDS.clear()
+        self.bridge = self.make_bridge()
+
+    def submit(self, code, run_id, **extra):
+        return self.request("POST", "/run", dict({"code": code, "run_id": run_id,
+                                                  "async": True}, **extra))
+
+    def wait_state(self, run_id, state):
+        for _ in range(500):
+            if self.request("POST", "/result", {"run_id": run_id})[1].get("state") == state:
+                return
+            time.sleep(0.01)
+        self.fail("job %s never got to %s" % (run_id, state))
+
+    def test_async_submit_and_long_poll(self):
+        status, reply = self.submit("gate.wait(); result = 42", "j1")
+        self.assertEqual((status, reply["run_id"], reply["job"]), (202, "j1", "j1"))
+        self.wait_state("j1", "running")
+        self.assertEqual(sorted(os.listdir(self.spool)), ["j1.json", "lost"])
+        threading.Timer(0.3, self.gate.set).start()
+        status, reply = self.request("POST", "/result", {"run_id": "j1", "wait": 5})
+        self.assertEqual((status, reply["state"], reply["reply"]["result"]), (200, "done", 42))
+        self.assertEqual(os.listdir(self.spool), ["lost"])        # unspooled when done
+        self.assertEqual(self.request("POST", "/result", {"run_id": "nope"})[0], 404)
+
+    def test_resubmitting_a_run_id_never_runs_twice(self):
+        for _ in range(3):
+            self.assertEqual(self.submit("hits.append(1)", "same")[0], 202)
+        self.request("POST", "/result", {"run_id": "same", "wait": 5})
+        self.assertEqual(self.hits, [1])
+
+    def test_bad_run_id_refused(self):
+        self.assertEqual(self.submit("pass", "../etc/x")[0], 400)
+
+    def test_queued_jobs_listed_with_full_bndb_path_in_status(self):
+        self.submit("gate.wait()", "busy", session="s", name="first")
+        self.wait_state("busy", "running")
+        self.submit("pass", "waiting", session="s", name="second")
+        self.wait_state("waiting", "queued")
+        status = json.loads(self.bnrun("--status", "--json").stdout)
+        self.assertEqual([(j["job"], j["state"]) for j in status["jobs"]],
+                         [("busy", "running"), ("waiting", "queued")])
+        text = self.bnrun("--status").stdout
+        self.assertIn("queued: 1 serialized, 0 parallel\n  queued script 'pass'", text)
+        self.assertNotIn("no script running", text)
+        jobs = self.bnrun("--jobs", "--session", "s").stdout
+        self.assertIn("busy  running script", jobs)
+        self.assertIn("waiting  queued script", jobs)
+
+    def test_lost_jobs_reported_requeued_and_forgotten(self):
+        self.submit("gate.wait()", "was-running", session="s", name="synthv")
+        self.wait_state("was-running", "running")
+        self.submit("hits.append('again')", "was-queued", session="s", name="synthv",
+                    args=["<bnrun>", "R:1:x"])
+        self.wait_state("was-queued", "queued")
+        self.crash_and_restart()
+        self.assertEqual(sorted(self.bridge.lost), ["was-queued", "was-running"])
+        self.assertIn("lost: 2 jobs", self.bnrun("--status").stdout)
+        self.assertEqual(json.loads(self.bnrun("--status", "--json").stdout)["lost"], 2)
+        # a client still waiting learns the job is lost
+        r = self.bnrun("--wait", "was-queued")
+        self.assertEqual(r.returncode, 4, r.stderr)
+        self.assertIn("bnrun --requeue was-queued", r.stderr)
+        r = self.bnrun("--jobs")
+        self.assertIn("was-running  lost script 'gate.wait()' (was running; synthv", r.stdout)
+        # the queued one reruns (with its args); the running one needs --force
+        r = self.bnrun("--requeue", "all", "--session", "s2", "-e", "x")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("was-running: was running when its bridge died", r.stderr)
+        self.assertIn("requeued was-queued as", r.stderr)
+        self.assertEqual(self.hits, ["again"])
+        self.assertEqual(list(self.bridge.lost), ["was-running"])
+        self.assertEqual(self.bnrun("--forget", "was-running").stdout, "forgot was-running\n")
+        self.assertEqual(self.bridge.lost, {})
+        self.assertEqual(os.listdir(os.path.join(self.spool, "lost")), [])
+        self.crash_and_restart()                                     # nothing comes back
+        self.assertEqual(self.bridge.lost, {})
+
+    def test_requeue_force_reruns_a_running_one(self):
+        self.submit("hits.append(1); gate.wait()", "r", session="s")
+        self.wait_state("r", "running")
+        self.crash_and_restart()
+        self.gate.set()
+        r = self.bnrun("--requeue", "r", "--force")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.hits, [1, 1])
+
+    def test_stop_start_in_one_process_loses_nothing_alive(self):
+        self.submit("gate.wait()", "alive")
+        self.wait_state("alive", "running")
+        self.bridge.stop()
+        self.bridge = self.make_bridge()          # same process: the job is still running
+        self.assertEqual(self.bridge.lost, {})
+
+    def test_bnrun_detach_and_wait(self):
+        r = self.bnrun("--detach", "-e", "gate.wait(); print('late')")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        run_id = r.stdout.strip()
+        self.assertRegex(run_id, "^[0-9a-f]{32}$")
+        threading.Timer(0.5, self.gate.set).start()
+        r = self.bnrun("--wait", run_id)
+        self.assertEqual((r.returncode, r.stdout), (0, "late\n"))
+
+    def test_bnrun_waits_across_an_unreachable_bridge(self):
+        self.submit("gate.wait(); print('done')", "j")
+        self.wait_state("j", "running")
+        port = self.bridge.port
+        self.bridge.httpd.shutdown()                 # unreachable for a while, job goes on
+        self.bridge.httpd.server_close()
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config)
+        proc = subprocess.Popen([sys.executable, BNRUN, "--wait", "j"], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+        time.sleep(3)
+        self.bridge.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port),
+                                                            self.bridge.httpd.RequestHandlerClass)
+        self.bridge.start()
+        self.gate.set()
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual((proc.returncode, out), (0, "done\n"), err)
+        self.assertIn("still waiting for job j", err)
+        self.assertIn("bridge back", err)
 
 
 class RunScriptExitTest(unittest.TestCase):
