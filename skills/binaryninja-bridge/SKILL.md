@@ -34,11 +34,11 @@ $BNRUN --bndb /path/target.bndb -e 'result = len(list(bv.functions))'
 $BNRUN --bndb-save            # write renames etc. into the .bndb (or save_bndb() inside the editing job -- preferred)
 $BNRUN --bndb-list            # cached views (also in --status), "(unsaved changes)" = edits a crash would lose; --bndb-close frees them
 ```
-Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no usage lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Scripts get `save_bndb()`: save in the same job as the edits, so a dead client can't leave them unsaved.
+Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no need to take the lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Scripts get `save_bndb()`: save in the same job as the edits, so a dead client can't leave them unsaved.
 - **Always `--timeout` on a big first open.** `--status` shows `opening the bndb ... for Ns` while it opens. It climbing with no CPU = starved by another heavy load (or a double open). `--timeout`/`--cancel` give up waiting: the job ends cancelled and the lane frees, while the native open goes on (`still opening: PATH`; runs on that file are refused until it finishes, then it is cached). Details: `reference.md`.
 
 ## Lanes and heavy loads
-- Default lane is serialized (one at a time). `--parallel` (own throwaway views: `binaryninja.load(path)` … `close()`, no UI/shared state, max 4) runs beside it, needs no lock, can't combine with `--view`/`--main-thread`.
+- Default lane is serialized (one at a time). `--parallel` (own throwaway views: `bv = binaryninja.load(path)` … `bv.file.close()` -- `BinaryView` has no `close()`; no UI/shared state, max 4) runs beside it, needs no lock of its own, can't combine with `--view`/`--main-thread`.
 - **Lanes don't isolate BN's native core**: a heavy parallel load (+ analysis + `create_database`) can starve or deadlock a big `--bndb` first open (2026-10-14: 51 MB kernelcache vs 1.23 GB `.bndb`, both wedged). Before either: `--status`, announce to the sessions sharing BN, `--timeout` on both. Huge raw binary → `--detach --bndb RAW --timeout N -e 'result = len(list(bv.functions))'` (load + analyse + cache, one job), then `--bndb-save` -- not one blocking parallel load-analyse-save script.
 
 ## Usage lock (UI views are shared — take it before touching them)
@@ -47,7 +47,7 @@ $BNRUN --lock --purpose "decompiling foo"      # take/renew (ttl 5 min; your scr
 $BNRUN --unlock
 ```
 - `bv`/`bvs`/`--view`/`--main-thread` need the lock (refused with exit 2 without it).
-- `--parallel` and `--bndb` runs need no lock.
+- `--parallel` and `--bndb` runs don't need you to hold the lock -- but while **another** session holds it, every run is refused (exit 3), these included: the lock means "BN is busy", not "UI views are taken".
 - Locked by another session → don't use BN; message them via `SendMessage`. Stale lock: `--unlock --force` or `--cancel --force` only after asking.
 - `--timeout N` on every long run (cancellation lands only between bytecodes; a long native call ignores it until it returns).
 

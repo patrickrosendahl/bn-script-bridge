@@ -111,7 +111,9 @@ Otherwise:
   is refused when it would start.
 
 Scripts that only create their own views through the API (`BinaryViewType[...].create(
-BinaryView.open(path))`, `BinaryView.open`, `binaryninja.load`, then `close()`) need no lock.
+BinaryView.open(path))`, `BinaryView.open`, `binaryninja.load`, then `bv.file.close()` -- a `BinaryView` has no
+`close()`) don't need you to hold the lock. Like every run, they are still refused (exit 3)
+while another session holds it.
 
 **Limitation:** this is enforced in the script namespace and otherwise relies on convention. A
 script can still reach UI views by other paths (`binaryninjaui.UIContext`, ...); don't.

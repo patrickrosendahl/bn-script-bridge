@@ -38,7 +38,9 @@ UI views need the usage lock: only a serialized script of the session holding th
 --lock) gets `bv` (the view whose filename contains --view SUBSTRING, or the one active in the
 UI) and `bvs` (all views open in the UI); --view and --main-thread are refused without the lock.
 Without it, `bv`/`bvs` raise UIViewsUnavailable when used. Scripts that only create their own
-views (BinaryViewType[...].create(BinaryView.open(path)), binaryninja.load) need no lock.
+views (BinaryViewType[...].create(BinaryView.open(path)), binaryninja.load; close with
+bv.file.close()) don't need you to hold the lock -- but while another session holds it, every
+run is refused (exit 3), --parallel and --bndb ones included.
 
 --bndb PATH opens that file headlessly (a .bndb opens its database and carries renames; a raw
 binary is analysed once), caches the view and hands it to the script as `bv` -- no usage lock
