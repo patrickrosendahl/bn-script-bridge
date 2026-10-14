@@ -920,12 +920,28 @@ class BndbCacheTest(BridgeFixture):
         status, reply = self.run_bndb(self.path())
         self.assertEqual((status, reply["error"]), (400, bridge_server.BNDB_NO_HOOKS))
 
+    def test_unsaved_changes_flag(self):
+        dirty = {}
+        self.bridge.bndb_modified = lambda v: dirty.get(v.path, False)
+        path = self.path()
+        self.run_bndb(path)
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"][0]["modified"], False)
+        dirty[path] = True                     # the next run edits it
+        self.run_bndb(path)
+        self.assertIn("cached views: target.bndb (unsaved changes)", self.bnrun("--status").stdout)
+        self.assertIn("(unsaved changes)", self.bnrun("--bndb-list").stdout)
+        self.assertEqual(self.request("POST", "/bndb", {"action": "save"})[0], 200)
+        self.assertEqual(self.request("GET", "/run")[1]["bndb"][0]["modified"], False)
+        dirty[path] = True
+        self.run_bndb(path, code="save_bndb()")    # the end of the run asks again
+        self.assertTrue(self.request("GET", "/run")[1]["bndb"][0]["modified"])
+
     def test_status_lists_cached_views(self):
         path = self.path()
         self.run_bndb(path)
         status, reply = self.request("GET", "/run")
         self.assertEqual(reply["bndb"], [{"path": os.path.abspath(path),
-                                          "name": "target.bndb"}])
+                                          "name": "target.bndb", "modified": None}])
         r = self.bnrun("--status")
         self.assertEqual(r.returncode, 0)
         self.assertIn("cached views: target.bndb", r.stdout)
@@ -948,7 +964,7 @@ class BndbCacheTest(BridgeFixture):
 
         status, reply = self.request("GET", "/run")
         self.assertEqual(reply["bndb"], [{"path": os.path.abspath(path),
-                                          "name": "target.bndb"}])
+                                          "name": "target.bndb", "modified": None}])
         self.assertIn("cached views: target.bndb", bridge_server.describe_runs(
             self.request("GET", "/run")[1]))
 
@@ -1084,11 +1100,12 @@ class JobsTest(BridgeFixture):
         status, reply = self.submit("gate.wait(); result = 42", "j1")
         self.assertEqual((status, reply["run_id"], reply["job"]), (202, "j1", "j1"))
         self.wait_state("j1", "running")
-        self.assertEqual(sorted(os.listdir(self.spool)), ["j1.json", "lost"])
+        self.assertEqual(sorted(os.listdir(self.spool)), ["done", "j1.json", "lost"])
         threading.Timer(0.3, self.gate.set).start()
         status, reply = self.request("POST", "/result", {"run_id": "j1", "wait": 5})
         self.assertEqual((status, reply["state"], reply["reply"]["result"]), (200, "done", 42))
-        self.assertEqual(os.listdir(self.spool), ["lost"])        # unspooled when done
+        self.assertEqual(sorted(os.listdir(self.spool)), ["done", "lost"])   # unspooled
+        self.assertEqual(os.listdir(os.path.join(self.spool, "done")), ["j1.json"])
         self.assertEqual(self.request("POST", "/result", {"run_id": "nope"})[0], 404)
 
     def test_resubmitting_a_run_id_never_runs_twice(self):
@@ -1159,6 +1176,71 @@ class JobsTest(BridgeFixture):
         self.bridge.stop()
         self.bridge = self.make_bridge()          # same process: the job is still running
         self.assertEqual(self.bridge.lost, {})
+
+    def test_finished_job_still_answers_after_a_crash(self):
+        self.submit("print('applied'); result = 7", "fin", session="s", name="synthv")
+        self.request("POST", "/result", {"run_id": "fin", "wait": 5})
+        self.crash_and_restart()
+        status, reply = self.request("POST", "/result", {"run_id": "fin"})
+        self.assertEqual((status, reply["state"], reply["previous_bridge"]), (200, "done", True))
+        self.assertEqual((reply["reply"]["stdout"], reply["reply"]["result"]), ("applied\n", 7))
+        r = self.bnrun("--wait", "fin")
+        self.assertEqual((r.returncode, r.stdout), (0, "applied\n7\n"), r.stderr)
+        self.assertIn("fin  done", self.bnrun("--jobs", "--session", "s").stdout)
+        self.assertEqual(self.bridge.lost, {})
+
+    def test_crash_between_done_and_unspool_is_not_lost(self):
+        self.submit("pass", "both", session="s")
+        self.request("POST", "/result", {"run_id": "both", "wait": 5})
+        with open(os.path.join(self.spool, "both.json"), "w") as f:    # left behind
+            json.dump({"run_id": "both", "state": "running", "request": {"code": "pass"}}, f)
+        self.crash_and_restart()
+        self.assertEqual(self.bridge.lost, {})
+        self.assertEqual(self.request("POST", "/result", {"run_id": "both"})[1]["state"], "done")
+
+    def test_done_records_expire(self):
+        self.submit("pass", "old")
+        self.request("POST", "/result", {"run_id": "old", "wait": 5})
+        path = os.path.join(self.spool, "done", "old.json")
+        past = time.time() - bridge_server.JOB_KEEP_SECONDS - 10
+        os.utime(path, (past, past))
+        self.crash_and_restart()
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.request("POST", "/result", {"run_id": "old"})[0], 404)
+
+    def test_concurrent_requeues_run_a_lost_job_once(self):
+        self.submit("gate.wait()", "busy", session="s")
+        self.wait_state("busy", "running")
+        self.submit("hits.append(1)", "once", session="s")
+        self.wait_state("once", "queued")
+        self.crash_and_restart()        # (the old bridge's threads live on: keep the gate shut)
+        check = self.bridge.check_run
+
+        def slow_check(req):
+            time.sleep(0.3)         # widen the window between reading and resubmitting
+            return check(req)
+        self.bridge.check_run = slow_check
+        replies = []
+        threads = [threading.Thread(target=lambda: replies.append(self.request(
+            "POST", "/lost", {"action": "requeue", "run_ids": ["once"], "session": "s"})[1]))
+            for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(sorted(r["ok"] for r in replies), [False, True])
+        new_id = [r for r in replies if r["ok"]][0]["results"][0]["new_run_id"]
+        self.request("POST", "/result", {"run_id": new_id, "wait": 5})
+        self.assertEqual(self.hits, [1])
+
+    def test_refused_requeue_keeps_the_lost_job(self):
+        self.submit("gate.wait()", "r", session="s")
+        self.wait_state("r", "running")
+        self.crash_and_restart()
+        reply = self.request("POST", "/lost", {"action": "requeue", "run_ids": ["r"]})[1]
+        self.assertFalse(reply["ok"])                  # was running: needs force
+        self.assertEqual(list(self.bridge.lost), ["r"])
+        self.assertTrue(os.path.exists(os.path.join(self.spool, "lost", "r.json")))
 
     def test_bnrun_cancel_one_job_by_run_id(self):
         self.submit("gate.wait()", "first", session="s")
@@ -1277,6 +1359,28 @@ class BndbOpenHangTest(BridgeFixture):
         reply = self.run_bndb(self.path(), code="import time; time.sleep(0.05)\n"
                               "while True: pass", timeout=1)[1]
         self.assertEqual(reply["cancelled_by"], "timeout after 1s")
+
+
+class BnrestartBusyTest(unittest.TestCase):
+    """bnrestart decides idle from `bnrun --status --json`, not from the prose."""
+
+    def setUp(self):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("bnrestart", os.path.join(ROOT, "bnrestart"))
+        spec = importlib.util.spec_from_loader("bnrestart", loader)
+        self.mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.mod)
+
+    def test_busy_reasons(self):
+        idle = {"running": None, "parallel": [], "queued": 0, "parallel_queued": 0,
+                "bndb_hung": [{"path": "/x.bndb", "stuck_for": 9}], "jobs": []}
+        self.assertEqual(self.mod.busy_reasons(idle), [])     # a stuck open doesn't block it
+        self.assertEqual(self.mod.busy_reasons(dict(idle, running={"label": "x"}, queued=2)),
+                         ["1 script(s) running", "2 queued"])
+        self.assertEqual(self.mod.busy_reasons(dict(idle, parallel=[{}], parallel_queued=1)),
+                         ["1 script(s) running", "1 queued"])
+        self.assertEqual(self.mod.busy_reasons({}), [])       # older bridge: missing keys
 
 
 class RunScriptExitTest(unittest.TestCase):

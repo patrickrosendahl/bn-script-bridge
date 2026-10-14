@@ -4,7 +4,8 @@
     bnrestart [--force] [--save-new | --discard] [--no-reopen] [--wait SECONDS]
 
 Refuses (exit 3) when another session holds the usage lock or a bridge script is running or
-queued in either lane (serialized or --parallel) -- unless --force. It takes the usage lock
+queued in either lane (serialized or --parallel) -- unless --force (decided from bnrun --status
+--json; a --bndb open its job gave up on doesn't count, the restart is what clears it). It takes the usage lock
 itself (as $CLAUDE_CODE_SESSION_ID, else bnrestart-<pid>) while it lists and saves the open
 views, since UI views are only visible to the lock holder; the restart clears the lock. Unsaved changes (analysis alone marks a view modified):
   - views that already have a .bndb are saved into it;
@@ -65,6 +66,19 @@ def release_lock():
         bnrun("--unlock")
 
 
+def busy_reasons(reply) -> list:
+    """Why the bridge isn't idle, from a `bnrun --status --json` reply (empty = idle). A --bndb
+    open its job gave up on (bndb_hung) doesn't count: a restart is what clears it."""
+    reasons = []
+    runs = ([reply["running"]] if reply.get("running") else []) + list(reply.get("parallel") or [])
+    if runs:
+        reasons.append("%d script(s) running" % len(runs))
+    queued = (reply.get("queued") or 0) + (reply.get("parallel_queued") or 0)
+    if queued:
+        reasons.append("%d queued" % queued)
+    return reasons
+
+
 def running() -> bool:
     return subprocess.run(["pgrep", "-f", PROCESS], capture_output=True).returncode == 0
 
@@ -82,23 +96,32 @@ def main() -> int:
 
     files = []
     if running():
-        status = bnrun("--status")
-        # --status exits non-zero while a lock is held; it reached the bridge if it printed a status
-        if not status.stdout.startswith(("free", "locked")):
+        status = bnrun("--status", "--json")
+        # --status exits 3 while a lock is held; it reached the bridge if it printed JSON
+        try:
+            reply = json.loads(status.stdout)
+        except ValueError:
+            reply = None
+        if reply is None:
             print("bnrestart: bridge unreachable: %s" % (status.stdout + status.stderr).strip(), file=sys.stderr)
             if not args.force:
                 return 2
         else:
-            text = status.stdout
+            lock = reply.get("lock") or {}
             me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-            locked_by_other = text.startswith("locked") and (not me or ("session %s)" % me) not in text)
-            # bnrun --status prints "no script running" only when both lanes are idle
-            busy = "no script running" not in text
-            if (locked_by_other or busy) and not args.force:
-                print("bnrestart: refused, Binary Ninja is in use:\n" + text.strip(), file=sys.stderr)
+            locked_by_other = bool(lock.get("locked")) and (not me or lock.get("session") != me)
+            reasons = busy_reasons(reply)
+            if (locked_by_other or reasons) and not args.force:
+                text = bnrun("--status").stdout.strip()
+                print("bnrestart: refused, Binary Ninja is in use (%s):\n%s"
+                      % ("; ".join((["locked by another session"] if locked_by_other else [])
+                                   + reasons), text), file=sys.stderr)
                 return 3
+            for hung in reply.get("bndb_hung") or []:
+                print("bnrestart: abandoning a --bndb open still stuck after %ds: %s"
+                      % (hung.get("stuck_for", 0), hung.get("path")))
             # bvs (the UI views) are only given to the lock holder's scripts
-            held_before = text.startswith("locked") and not locked_by_other
+            held_before = bool(lock.get("locked")) and not locked_by_other
             locked = bnrun("--lock", "--purpose", "bnrestart: saving views and restarting")
             TOOK_LOCK = locked.returncode == 0 and not held_before
             if locked.returncode != 0:

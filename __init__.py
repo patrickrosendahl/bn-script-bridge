@@ -248,7 +248,8 @@ def start(*_args):
         max_parallel=lambda: Settings().get_integer("scriptbridge.maxParallel"),
         base_namespace={"binaryninja": binaryninja, "bn": binaryninja},
         bndb_open=_bndb_open, bndb_save=_bndb_save, bndb_close=_bndb_close,
-        spool_dir=os.path.join(binaryninja.user_directory(), SPOOL_NAME))
+        spool_dir=os.path.join(binaryninja.user_directory(), SPOOL_NAME),
+        bndb_modified=lambda bv: bv.file.modified)
     if _bridge.lost:
         log_warn("Script bridge: %d job(s) lost when Binary Ninja last stopped (never rerun on "
                  "their own): bnrun --jobs, then --requeue ID|all or --forget ID|all"

@@ -133,6 +133,7 @@ DEFAULT_MAX_PARALLEL = 4
 JOB_KEEP = 100                  # finished jobs whose reply /result still gives
 JOB_KEEP_SECONDS = 60 * 60
 MAX_RESULT_WAIT = 60
+DONE_STDOUT_KEEP = 64 * 1024    # stdout kept in a finished job's on-disk record
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # The request fields a job is spooled (and requeued) with.
 JOB_FIELDS = ("code", "view", "main_thread", "parallel", "bndb", "args", "env", "timeout")
@@ -451,7 +452,7 @@ class Run:
         self.open_seconds = 0.0                      # spent opening; counts against timeout
 
     def state_name(self) -> str:
-        if self.reply is not None:
+        if self.done.is_set():      # set after the reply and its on-disk record are written
             return "done"
         if not self.in_lane:
             return "queued"
@@ -539,7 +540,8 @@ def describe_runs(reply: Dict[str, Any]) -> str:
         lines.append("lost: %d job%s whose Binary Ninja stopped before they finished "
                      "(bnrun --jobs; --requeue ID|all, --forget ID|all)"
                      % (reply["lost"], "" if reply["lost"] == 1 else "s"))
-    cached = [v.get("name") for v in reply.get("bndb") or []]
+    cached = [v.get("name") + (" (unsaved changes)" if v.get("modified") else "")
+              for v in reply.get("bndb") or []]
     if cached:
         lines.append("cached views: %s" % ", ".join(cached))
     return "\n".join(lines)
@@ -577,7 +579,8 @@ class ScriptBridge:
                  bndb_open: Optional[Callable[[str], Any]] = None,
                  bndb_save: Optional[Callable[[Any], bool]] = None,
                  bndb_close: Optional[Callable[[Any], None]] = None,
-                 spool_dir: Optional[str] = None):
+                 spool_dir: Optional[str] = None,
+                 bndb_modified: Optional[Callable[[Any], bool]] = None):
         """namespace_factory(view) gives the UI views (bv, bvs, ...) and is only called for
         scripts allowed to use them; base_namespace (e.g. the binaryninja module) is what every
         script gets. max_parallel: int, or a callable read whenever a parallel script waits.
@@ -585,7 +588,10 @@ class ScriptBridge:
         (open a path -> view or None, save a view -> bool, close a view); None disables
         the --bndb cache (see the module docstring); a --bndb script also gets save_bndb(),
         which saves its view with bndb_save within the job. spool_dir keeps queued and running jobs
-        on disk so the next bridge can report them as lost (None: no spool)."""
+        on disk so the next bridge can report them as lost, and finished ones for JOB_KEEP_SECONDS
+        so it can still answer for them (None: no spool). bndb_modified(view) -> whether a cached
+        view has unsaved changes; asked only from the job thread after each --bndb run and kept,
+        so a status request never calls into Binary Ninja (None: unknown)."""
         self.token = token
         self.namespace_factory = namespace_factory
         self.base_namespace = dict(base_namespace or {})
@@ -598,6 +604,8 @@ class ScriptBridge:
         self.bndb_mutex = threading.Lock()
         self.bndb_views: Dict[str, Any] = {}    # abspath -> cached view handle
         self.bndb_hung: Dict[str, float] = {}   # abspath -> since: an abandoned, unfinished open
+        self.bndb_modified = bndb_modified
+        self.bndb_dirty: Dict[str, Optional[bool]] = {}   # abspath -> unsaved changes, as last seen
         self.run_mutex = threading.Lock()    # serialized lane: one script at a time
         self.state = threading.Lock()        # guards current, queued, parallel*, cancelled_ids
         self.slot_free = threading.Condition(self.state)   # a parallel slot or cancel happened
@@ -608,6 +616,7 @@ class ScriptBridge:
         self.cancelled_ids: Dict[str, str] = {}   # run_id -> by, for runs not started yet
         self.jobs: Dict[str, Run] = {}       # run_id -> job, oldest first (guarded by state)
         self.spool_dir = spool_dir
+        self.done_records: Dict[str, Dict[str, Any]] = self._load_done()   # previous bridges'
         self.lost: Dict[str, Dict[str, Any]] = self._load_lost()   # run_id -> spool record
         bridge = self
 
@@ -820,14 +829,15 @@ class ScriptBridge:
 
     def run_status(self) -> Dict[str, Any]:
         """Both lanes: the GET /run reply without "ok"."""
+        bndb, hung = self.bndb_status(), self.bndb_hung_status()
         with self.state:
             return {"running": self.current.status() if self.current else None,
                     "queued": self.queued,
                     "parallel": [r.status() for r in self.parallel_runs],
                     "parallel_queued": self.parallel_queued,
                     "max_parallel": self.limit(),
-                    "bndb": self.bndb_status(),
-                    "bndb_hung": self.bndb_hung_status(),
+                    "bndb": bndb,
+                    "bndb_hung": hung,
                     "jobs": [r.status() for r in self.jobs.values() if r.reply is None],
                     "lost": len(self.lost)}
 
@@ -899,8 +909,9 @@ class ScriptBridge:
                     "ok": False, "stdout": "", "result": None,
                     "error": "the bridge failed to run the script (see Binary Ninja's log)"}
                 run.finished_at = time.time()
-            run.done.set()
+            self._write_done(run)       # first: a crash in between leaves done, not lost
             self._unspool(run)
+            run.done.set()              # last: a waiter told "done" sees the disk state too
 
     def _enter_lane(self, run: Run) -> None:
         """Called with state held once the run holds its lane."""
@@ -925,6 +936,8 @@ class ScriptBridge:
                 finally:
                     if run.timer is not None:
                         run.timer.cancel()
+                    if run.bndb:
+                        self._refresh_dirty(run.bndb)   # still holding the lane
                     with self.state:
                         self.current = None
                         run.finished = True
@@ -949,6 +962,11 @@ class ScriptBridge:
         if run is None:
             if lost is not None:
                 return 200, {"ok": True, "state": "lost", "lost": self._lost_summary(lost)}
+            done = self.done_records.get(run_id)
+            if done is not None and time.time() - (done.get("finished_at") or 0) \
+                    <= JOB_KEEP_SECONDS:
+                return 200, {"ok": True, "state": "done", "run": self._done_status(done),
+                             "reply": done.get("reply"), "previous_bridge": True}
             return 404, {"ok": False, "state": "unknown",
                          "error": "no such job (unknown, or finished over %d minutes ago)"
                                   % (JOB_KEEP_SECONDS // 60)}
@@ -961,7 +979,9 @@ class ScriptBridge:
         """POST /jobs: this session's jobs and every lost one, with run_ids."""
         session = session if isinstance(session, str) and session else None
         with self.state:
-            jobs = [r.status(full=True) for r in self.jobs.values() if r.session == session]
+            jobs = [self._done_status(rec) for rec in self.done_records.values()
+                    if rec.get("session") == session and rec["run_id"] not in self.jobs]
+            jobs += [r.status(full=True) for r in self.jobs.values() if r.session == session]
             lost = [self._lost_summary(rec) for rec in self.lost.values()]
         return {"ok": True, "jobs": jobs, "lost": lost}
 
@@ -977,14 +997,18 @@ class ScriptBridge:
             elif not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
                 return 400, {"ok": False, "error": 'bad request: run_ids must be a list of '
                                                    'strings or "all"'}
-            records = {i: self.lost.get(i) for i in ids}
+            # Claimed (taken out of self.lost) at once, so two concurrent requeues can't both
+            # rerun one job; a record that isn't used goes back.
+            records = {i: self.lost.pop(i, None) for i in dict.fromkeys(ids)}
         results = []
         for old_id, rec in records.items():
             entry: Dict[str, Any] = {"run_id": old_id}
+            used = False
             if rec is None:
-                entry.update(ok=False, error="not a lost job")
+                entry.update(ok=False, error="not a lost job (or another request is handling "
+                                             "it)")
             elif action == "forget":
-                self._drop_lost(old_id)
+                used = True
                 entry.update(ok=True)
             elif rec.get("state") != "queued" and not req.get("force"):
                 entry.update(ok=False, error="was %s when its bridge died: it may have applied "
@@ -997,9 +1021,14 @@ class ScriptBridge:
                 if refusal:
                     entry.update(ok=False, status=refusal[0], error=refusal[1].get("error"))
                 else:
-                    self._drop_lost(old_id)
+                    used = True
                     run = self.submit(params)
                     entry.update(ok=True, new_run_id=run.run_id, label=run.label)
+            if used:
+                self._drop_lost(old_id)
+            elif rec is not None:
+                with self.state:
+                    self.lost[old_id] = rec
             results.append(entry)
         return 200, {"ok": all(r["ok"] for r in results), "action": action,
                      "results": results}
@@ -1011,9 +1040,89 @@ class ScriptBridge:
         out["request"] = {"bndb": (rec.get("request") or {}).get("bndb")}
         return out
 
-    def _spool_file(self, run_id: str, lost: bool = False) -> str:
+    def _spool_file(self, run_id: str, lost: bool = False, done: bool = False) -> str:
         assert self.spool_dir and RUN_ID.fullmatch(run_id)
-        return os.path.join(self.spool_dir, "lost" if lost else "", run_id + ".json")
+        sub = "lost" if lost else "done" if done else ""
+        return os.path.join(self.spool_dir, sub, run_id + ".json")
+
+    @staticmethod
+    def _write_json(path: str, record: Dict[str, Any]) -> None:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+
+    def _write_done(self, run: Run) -> None:
+        """Keep a finished job's outcome on disk for JOB_KEEP_SECONDS, so a bridge started
+        after a crash can still say it finished (and how) instead of "unknown"."""
+        if not self.spool_dir or not RUN_ID.fullmatch(run.run_id):
+            return
+        reply = dict(run.reply or {})
+        stdout = reply.get("stdout") or ""
+        if len(stdout) > DONE_STDOUT_KEEP:
+            reply["stdout"] = stdout[:DONE_STDOUT_KEEP] + (
+                "\n[bridge: output truncated to %d characters after a Binary Ninja restart]\n"
+                % DONE_STDOUT_KEEP)
+        try:
+            json.dumps(reply.get("result"))
+        except (TypeError, ValueError):
+            reply["result"] = repr(reply.get("result"))
+        record = {"run_id": run.run_id, "session": run.session, "name": run.name,
+                  "label": run.label, "bndb": run.bndb, "submitted_at": run.queued_at,
+                  "finished_at": run.finished_at, "reply": reply}
+        try:
+            self._write_json(self._spool_file(run.run_id, done=True), record)
+            self._prune_done_files()
+        except OSError:
+            pass    # best effort, like the spool
+
+    def _prune_done_files(self) -> None:
+        done_dir = os.path.join(self.spool_dir, "done")
+        cutoff = time.time() - JOB_KEEP_SECONDS
+        for fname in os.listdir(done_dir):
+            path = os.path.join(done_dir, fname)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+
+    def _load_done(self) -> Dict[str, Dict[str, Any]]:
+        """Finished-job records younger than JOB_KEEP_SECONDS, from earlier bridges."""
+        if not self.spool_dir:
+            return {}
+        done_dir = os.path.join(self.spool_dir, "done")
+        records = {}
+        try:
+            os.makedirs(done_dir, mode=0o700, exist_ok=True)
+            self._prune_done_files()
+            names = os.listdir(done_dir)
+        except OSError:
+            return {}
+        for fname in names:
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(done_dir, fname)) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if isinstance(rec, dict) and RUN_ID.fullmatch(str(rec.get("run_id"))):
+                records[rec["run_id"]] = rec
+        return records
+
+    @staticmethod
+    def _done_status(rec: Dict[str, Any]) -> Dict[str, Any]:
+        """A previous bridge's finished job, shaped like Run.status(full=True)."""
+        reply = rec.get("reply") or {}
+        now = time.time()
+        return {"run_id": rec["run_id"], "job": rec["run_id"][:8], "session": rec.get("session"),
+                "name": rec.get("name"), "label": rec.get("label"), "bndb": rec.get("bndb"),
+                "state": "done", "ok": bool(reply.get("ok")), "error": reply.get("error"),
+                "finished_ago": int(now - (rec.get("finished_at") or now)),
+                "previous_bridge": True}
 
     def _spool(self, run: Run) -> None:
         """Write (or rewrite, once it is in its lane) the job's spool record."""
@@ -1024,14 +1133,8 @@ class ScriptBridge:
                   "session": run.session, "name": run.name, "label": run.label,
                   "submitted_at": run.queued_at, "started_at": time.time() if run.in_lane
                   else None, "pid": os.getpid(), "request": run.request}
-        path = self._spool_file(run.run_id)
         try:
-            os.makedirs(self.spool_dir, mode=0o700, exist_ok=True)
-            tmp = path + ".tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(record, f)
-            os.replace(tmp, path)
+            self._write_json(self._spool_file(run.run_id), record)
         except OSError:
             pass    # the spool is best effort; the job runs anyway
         if run.reply is not None:   # finished while being written
@@ -1057,7 +1160,12 @@ class ScriptBridge:
             return {}
         for fname in names:
             run_id = fname[:-5] if fname.endswith(".json") else None
-            if run_id and RUN_ID.fullmatch(run_id) and run_id not in _LIVE_RUN_IDS:
+            if run_id and RUN_ID.fullmatch(run_id) and run_id in self.done_records:
+                try:        # finished; the crash came before its spool file went
+                    os.remove(os.path.join(self.spool_dir, fname))
+                except OSError:
+                    pass
+            elif run_id and RUN_ID.fullmatch(run_id) and run_id not in _LIVE_RUN_IDS:
                 try:
                     os.replace(os.path.join(self.spool_dir, fname),
                                os.path.join(lost_dir, fname))
@@ -1065,6 +1173,8 @@ class ScriptBridge:
                     pass
         lost = {}
         for fname in sorted(os.listdir(lost_dir)):
+            if not fname.endswith(".json"):
+                continue
             try:
                 with open(os.path.join(lost_dir, fname)) as f:
                     rec = json.load(f)
@@ -1209,7 +1319,7 @@ class ScriptBridge:
         job (so a client dying after the edits can't orphan the save); the path, or raises."""
         if not self.bndb_save or not self.bndb_save(handle):
             raise RuntimeError("saving %s failed" % os.path.abspath(path))
-        return os.path.abspath(path)
+        return os.path.abspath(path)     # the run's end refreshes bndb_dirty
 
     def bndb_hung_status(self) -> List[Dict[str, Any]]:
         """Abandoned opens still stuck inside Binary Ninja, for GET /run."""
@@ -1221,8 +1331,25 @@ class ScriptBridge:
     def bndb_status(self) -> List[Dict[str, Any]]:
         """The cached headless views, for GET /run."""
         with self.bndb_mutex:
-            return [{"path": path, "name": os.path.basename(path)}
+            return [{"path": path, "name": os.path.basename(path),
+                     "modified": self.bndb_dirty.get(path)}
                     for path in sorted(self.bndb_views)]
+
+    def _refresh_dirty(self, path: str) -> None:
+        """Ask the plugin whether the cached view of `path` has unsaved changes (job thread
+        only, see __init__); None when unknown."""
+        key = os.path.abspath(path)
+        with self.bndb_mutex:
+            handle = self.bndb_views.get(key)
+        if handle is None:
+            return
+        try:
+            dirty = bool(self.bndb_modified(handle)) if self.bndb_modified else None
+        except Exception:  # noqa: BLE001 -- unknown, not fatal
+            dirty = None
+        with self.bndb_mutex:
+            if key in self.bndb_views:
+                self.bndb_dirty[key] = dirty
 
     def bndb_paths(self, path: Optional[str]) -> List[str]:
         """Cached abspaths matching `path` (None = all; no match = empty)."""
@@ -1245,6 +1372,10 @@ class ScriptBridge:
             except Exception as e:  # noqa: BLE001 -- report, don't fail the others
                 results.append({"path": path, "ok": False, "error": repr(e)})
                 continue
+            if ok:
+                with self.bndb_mutex:
+                    if path in self.bndb_views:
+                        self.bndb_dirty[path] = False
             results.append({"path": path, "ok": True} if ok
                            else {"path": path, "ok": False, "error": "save failed"})
         return results
@@ -1266,6 +1397,7 @@ class ScriptBridge:
                 ok = True
             with self.bndb_mutex:
                 self.bndb_views.pop(path, None)
+                self.bndb_dirty.pop(path, None)
             results.append({"path": path, "ok": ok})
         return results
 
@@ -1274,6 +1406,7 @@ class ScriptBridge:
         with self.bndb_mutex:
             views = list(self.bndb_views.items())
             self.bndb_views.clear()
+            self.bndb_dirty.clear()
         for _path, handle in views:
             try:
                 if self.bndb_close:

@@ -450,7 +450,7 @@ def bndb_command(args) -> int:
         if not cached:
             print("no cached views")
         for view in cached:
-            print(view["path"])
+            print(view["path"] + ("  (unsaved changes)" if view.get("modified") else ""))
         return 0
     action = "save" if args.bndb_save is not None else "close"
     path = args.bndb_save if action == "save" else args.bndb_close

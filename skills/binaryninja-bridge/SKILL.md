@@ -25,14 +25,14 @@ $BNRUN --wait RUN_ID                           # output + exit status of that jo
 $BNRUN --jobs                                  # this session's jobs (full run ids, done ones for 1 h) + lost ones
 $BNRUN --cancel RUN_ID                         # exactly that job (also queued); backgrounded bnruns share your session id
 ```
-**Lost jobs** (BN force-quit/crashed/Stopped while they were queued or running) stay on disk, shown as `lost: N` in `--status`; `--wait` on one exits 4. Nothing reruns on its own: `--requeue RUN_ID|all` reruns never-started ones (and waits); a job that was *running* needs `--force` -- check first, it may be half-applied or be what wedged BN. `--forget RUN_ID|all` drops them.
+**Lost jobs** (BN force-quit/crashed/Stopped while they were queued or running) stay on disk, shown as `lost: N` in `--status`; `--wait` on one exits 4. Nothing reruns on its own: `--requeue RUN_ID|all` reruns never-started ones (and waits); a job that was *running* needs `--force` -- check first, it may be half-applied or be what wedged BN. `--forget RUN_ID|all` drops them. A job that *finished* before a crash still answers `--wait`/`--jobs` as done (outcome kept on disk for 1 h) -- check that before deciding anything was lost.
 These need the plugin from 2026-10-14 or later (loaded at a BN restart); against an older one `bnrun` falls back to one held-open request (still no client timeout), `--detach`/`--wait` are refused, and `annotate --save` / `bnannotate --save` on a `--bndb` run fail with "--save needs a --bndb run" (no `save_bndb`): restart BN, or edit without `--save` and run `--bndb-save` after.
 
 ## `--bndb` fast path (no lock, no re-analysis)
 ```sh
 $BNRUN --bndb /path/target.bndb -e 'result = len(list(bv.functions))'
 $BNRUN --bndb-save            # write renames etc. into the .bndb (or save_bndb() inside the editing job -- preferred)
-$BNRUN --bndb-list            # cached views (also in --status); --bndb-close frees them
+$BNRUN --bndb-list            # cached views (also in --status), "(unsaved changes)" = edits a crash would lose; --bndb-close frees them
 ```
 Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no usage lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Scripts get `save_bndb()`: save in the same job as the edits, so a dead client can't leave them unsaved.
 - **Always `--timeout` on a big first open.** `--status` shows `opening the bndb ... for Ns` while it opens. It climbing with no CPU = starved by another heavy load (or a double open). `--timeout`/`--cancel` give up waiting: the job ends cancelled and the lane frees, while the native open goes on (`still opening: PATH`; runs on that file are refused until it finishes, then it is cached). Details: `reference.md`.

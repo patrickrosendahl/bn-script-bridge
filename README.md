@@ -162,7 +162,7 @@ binary is analysed once (the first run) and `--bndb-save` materializes `<file>.b
 ```sh
 bnrun --bndb synthv-studio.x86_64.bndb -e 'result = len(list(bv.functions))'
 bnrun --bndb synthv-studio.x86_64.bndb script.py -- extra-arg
-bnrun --bndb-list                                 # what's cached (also in --status)
+bnrun --bndb-list                                 # what's cached (also in --status), "(unsaved changes)" marks edits not yet saved
 bnrun --bndb-save                                 # write renames etc. back into the .bndb
 bnrun --bndb-close                                # free the memory (tens of MB per view)
 ```
@@ -266,11 +266,13 @@ bnrun --forget RUN_ID ...|all    # drop lost jobs
 
 The bridge spools each queued or running job to
 `~/Library/Application Support/Binary Ninja/script_bridge_spool/` (mode 0600) and removes it
-when it finishes. Jobs still there when the bridge next starts -- Binary Ninja crashed, was
+when it finishes; a finished job's outcome (ok/error, result, the first 64 KB of its output)
+stays in `done/` for an hour, so after a crash `--wait`/`--jobs` still report it as done instead
+of unknown. Jobs still there when the bridge next starts -- Binary Ninja crashed, was
 force-quit or stopped first -- are **lost**: reported in Binary Ninja's log, by `--status`
 (`lost: N jobs`), `--jobs`, and to a client waiting on one (`--wait` exits 4). None is rerun on
 its own; `--requeue` reruns them as new jobs of the calling session (same checks as a fresh
-run), and one that was already running needs `--force`: it may have applied part of its edits,
+run; each lost job is claimed first, so two requeues at once can't run it twice), and one that was already running needs `--force`: it may have applied part of its edits,
 or be what wedged Binary Ninja.
 
 ## Cancelling scripts
@@ -409,8 +411,9 @@ All endpoints need the token (see [Security](#security)).
 - `GET /ping` → `{"ok": true, "jobs": true}` (`jobs`: the bridge speaks the job protocol;
   older bridges get one `/run` held open to the end).
 - `GET /run` → `{"running": <serialized run or null>, "queued": N, "parallel": [<run>, ...],
-  "parallel_queued": M, "max_parallel": K, "bndb": [{path, name}, ...], "jobs": [<run>, ...],
-  "lost": L}`; `jobs` are the unfinished runs (queued ones included), oldest first; each run
+  "parallel_queued": M, "max_parallel": K, "bndb": [{path, name, modified}, ...],
+  "bndb_hung": [{path, stuck_for}, ...], "jobs": [<run>, ...], "lost": L}` (`modified`: the
+  cached view had unsaved changes after its last run, `null` if unknown); `jobs` are the unfinished runs (queued ones included), oldest first; each run
   has `session`, `name`, `label`, `main_thread`, `parallel`, `timeout`, `bndb`, `job` (first
   8 characters of the run id), `state` (`queued`, `starting`, `running`), `queued_for`,
   `running_for`, `cancel_requested`.
@@ -424,7 +427,7 @@ All endpoints need the token (see [Security](#security)).
   "job", "state"}` at once (a known `run_id`: that job, not run again).
 - `POST /result {"run_id", "wait"?}` → `{"state", "run", "reply"}`, waiting up to `wait`
   seconds (max 60) for the job; `reply` (the synchronous `/run` reply) once `state` is
-  `done`; `{"state": "lost", "lost": {...}}` for a lost job; 404 if unknown or expired.
+  `done` (`"previous_bridge": true` when it finished before a restart); `{"state": "lost", "lost": {...}}` for a lost job; 404 if unknown or expired.
 - `POST /jobs {"session"}` → `{"jobs": [that session's runs with run_id, ok, error,
   finished_ago], "lost": [...]}`.
 - `POST /lost {"action": "requeue"|"forget", "run_ids": [...]|"all", "force"?, "session",
