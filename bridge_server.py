@@ -532,9 +532,9 @@ def describe_runs(reply: Dict[str, Any]) -> str:
         lines += ["  " + describe_run(r) for r in reply.get("jobs") or []
                   if r.get("state") == "queued"]
     for hung in reply.get("bndb_hung") or []:
-        lines.append("stuck opening: %s for %ds (abandoned; --bndb runs of it are refused "
-                     "until it finishes or Binary Ninja restarts)" % (hung["path"],
-                                                                      hung["stuck_for"]))
+        lines.append("still opening: %s for %ds (its job stopped waiting; --bndb runs of it "
+                     "are refused until the open finishes, then it is cached)"
+                     % (hung["path"], hung["stuck_for"]))
     if reply.get("lost"):
         lines.append("lost: %d job%s whose Binary Ninja stopped before they finished "
                      "(bnrun --jobs; --requeue ID|all, --forget ID|all)"
@@ -583,7 +583,8 @@ class ScriptBridge:
         script gets. max_parallel: int, or a callable read whenever a parallel script waits.
         bndb_open/bndb_save/bndb_close are the plugin's hooks for the cached headless views
         (open a path -> view or None, save a view -> bool, close a view); None disables
-        the --bndb cache (see the module docstring). spool_dir keeps queued and running jobs
+        the --bndb cache (see the module docstring); a --bndb script also gets save_bndb(),
+        which saves its view with bndb_save within the job. spool_dir keeps queued and running jobs
         on disk so the next bridge can report them as lost (None: no spool)."""
         self.token = token
         self.namespace_factory = namespace_factory
@@ -673,7 +674,11 @@ class ScriptBridge:
                     return _reply_json(self, *bridge.cancel(
                         req.get("session"), req.get("run_id"), bool(req.get("force"))))
                 if self.path == "/result":
-                    return _reply_json(self, *bridge.result(req.get("run_id"), req.get("wait")))
+                    try:
+                        return _reply_json(self, *bridge.result(req.get("run_id"),
+                                                                req.get("wait")))
+                    except (BrokenPipeError, ConnectionResetError):
+                        return      # the poller went away (bnrun killed); the job goes on
                 if self.path == "/jobs":
                     return _reply_json(self, 200, bridge.jobs_of(req.get("session")))
                 if self.path == "/lost":
@@ -1108,8 +1113,9 @@ class ScriptBridge:
         headless view for a bndb run. Raises LookupError (bad view filter, or the bndb couldn't
         be opened) or UIViewsUnavailable (view not allowed)."""
         if run.bndb:
-            return dict(self.base_namespace, bv=self._bndb_view(run.bndb, run),
-                        bvs=NoUIViews("bvs", BNDB_BVS))
+            handle = self._bndb_view(run.bndb, run)
+            return dict(self.base_namespace, bv=handle, bvs=NoUIViews("bvs", BNDB_BVS),
+                        save_bndb=lambda: self._save_in_run(run.bndb, handle))
         if run.parallel:
             reason = PARALLEL_NO_UI
         elif not self.lock.holds(run.session):
@@ -1142,10 +1148,11 @@ class ScriptBridge:
                 return self.bndb_views[key]
             if key in self.bndb_hung:
                 raise LookupError(
-                    "an earlier open of %s has been stuck inside Binary Ninja for %ds and was "
-                    "abandoned; refusing to open it again. Usually the file is also open "
-                    "elsewhere (a UI tab, an MCP item): close that, or restart Binary Ninja "
-                    "(bnrestart)" % (key, time.time() - self.bndb_hung[key]))
+                    "%s is still opening inside Binary Ninja (for %ds; the job that started "
+                    "it stopped waiting); refusing a second open. Retry when --status no longer "
+                    "shows it (its view is then cached); if it never finishes, it is stuck "
+                    "(e.g. starved by another heavy load): restart Binary Ninja (bnrestart)"
+                    % (key, time.time() - self.bndb_hung[key]))
         box: Dict[str, Any] = {}
         done = threading.Event()
 
@@ -1181,10 +1188,11 @@ class ScriptBridge:
                         self.bndb_hung[key] = started
                         raise OpenAbandoned(
                             "abandoned opening %s after %ds (%s); the open goes on inside "
-                            "Binary Ninja (a native call can't be interrupted) and further "
-                            "--bndb runs of it are refused until it finishes. If it never "
-                            "does, the file is likely open elsewhere too (a UI tab): close "
-                            "that, or restart Binary Ninja" % (key, time.time() - started, why))
+                            "Binary Ninja (a native call can't be interrupted) and its view is "
+                            "cached when it finishes; until then further --bndb runs of it are "
+                            "refused (--status: still opening). If it never finishes, it is "
+                            "stuck -- starved by another heavy load, or the file is open "
+                            "elsewhere too: restart Binary Ninja" % (key, time.time() - started, why))
         finally:
             if run is not None:
                 run.open_seconds = time.time() - started
@@ -1195,6 +1203,13 @@ class ScriptBridge:
         with self.bndb_mutex:
             self.bndb_views[key] = box["handle"]
         return box["handle"]
+
+    def _save_in_run(self, path: str, handle: Any) -> str:
+        """save_bndb() for a --bndb script: save its cached view into the .bndb within the same
+        job (so a client dying after the edits can't orphan the save); the path, or raises."""
+        if not self.bndb_save or not self.bndb_save(handle):
+            raise RuntimeError("saving %s failed" % os.path.abspath(path))
+        return os.path.abspath(path)
 
     def bndb_hung_status(self) -> List[Dict[str, Any]]:
         """Abandoned opens still stuck inside Binary Ninja, for GET /run."""

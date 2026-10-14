@@ -40,7 +40,8 @@ $BNRUN --lock --purpose "decompiling foo"      # take/renew (ttl 5 min; your scr
 $BNRUN --unlock
 ```
 - `bv`/`bvs`/`--view`/`--main-thread` need the lock (refused with exit 2 without it).
-- `--parallel` (own throwaway views: `binaryninja.load(path)` … `close()`, no UI/shared state, max 4) needs none — can't combine with `--view`/`--main-thread`.
+- `--parallel` (own throwaway views: `binaryninja.load(path)` … `close()`, no UI/shared state, max 4) needs none — can't combine with `--view`/`--main-thread`. Lanes don't isolate BN's native core: a heavy parallel load can starve or deadlock a big `--bndb` first open. Check `--status` and announce before either; `--timeout` on both; huge raw binary → `--detach --bndb RAW` then `--bndb-save`, not one blocking parallel load+analyse+save script.
+- Backgrounded `bnrun`s share your session id: cancel one with `--cancel RUN_ID`.
 - Locked by another session → don't use BN; message them via `SendMessage`. Stale lock: `--unlock --force` or `--cancel --force` only after asking.
 - `--timeout N` on every long run (cancellation lands only between bytecodes).
 
@@ -50,9 +51,9 @@ $BNRUN --bndb $DB annotate -- R:0x401000:parse_header D:0x405000:cfg_table "C:0x
 $BNRUN --bndb $DB info -- F:0x401000 S:maxFunctionSize    # function + analysis-skip state; settings
 $BNRUN --bndb $DB decompile -- 0x401000 > /tmp/f.hlil     # un-skips huge functions, prints full HLIL
 BNANNOTATE=/Users/patrick/dev/bn-script-bridge/bnannotate
-$BNANNOTATE --bndb $DB --save R:0x401000:parse_header "C:0x401020:..."   # annotate + --bndb-save
+$BNANNOTATE --bndb $DB --save R:0x401000:parse_header "C:0x401020:..."   # annotate + save, one job
 ```
-`annotate`: `R:` renames the function **starting** at ADDR, `D:` a data symbol, `C:` sets a comment (replaces it; the old text is printed). All directives are validated first: one bad → nothing applied, exit 1. Works on `--view` too (with the lock). `bnannotate`: directive-shaped args go to annotate, the rest to bnrun; `--save` only after a successful batch.
+`annotate`: `R:` renames the function **starting** at ADDR, `D:` a data symbol, `C:` sets a comment (replaces it; the old text is printed). All directives are validated first: one bad → nothing applied, exit 1. Works on `--view` too (with the lock). `bnannotate`: directive-shaped args go to annotate, the rest to bnrun; `--save` saves the `.bndb` inside the same job after a successful batch (`annotate -- --save ...`), so a dead client can't orphan the save; it does nothing on a failed batch.
 
 ## Views
 One open item usually has a parsed view (`ELF`/`Mach-O`/`PE`) and a `Raw` — never read from `Raw`. `--view SUBSTR` picks by filename; without it, `bv` is the UI-active view. Wait for analysis idle (`bv.update_analysis_and_wait()`) before trusting results.

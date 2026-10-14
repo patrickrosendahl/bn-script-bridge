@@ -1160,6 +1160,20 @@ class JobsTest(BridgeFixture):
         self.bridge = self.make_bridge()          # same process: the job is still running
         self.assertEqual(self.bridge.lost, {})
 
+    def test_bnrun_cancel_one_job_by_run_id(self):
+        self.submit("gate.wait()", "first", session="s")
+        self.wait_state("first", "running")
+        self.submit("hits.append(1)", "second", session="s")
+        self.wait_state("second", "queued")
+        r = self.bnrun("--cancel", "second", "--session", "s")
+        self.assertEqual(r.stdout, "cancel sent: job second isn't running; it won't start\n")
+        self.gate.set()
+        reply = self.request("POST", "/result", {"run_id": "second", "wait": 5})[1]
+        self.assertEqual(reply["reply"]["error"], "cancelled")
+        self.assertEqual(self.hits, [])
+        self.assertTrue(self.request("POST", "/result", {"run_id": "first", "wait": 5})[1]
+                        ["reply"]["ok"])
+
     def test_bnrun_detach_and_wait(self):
         r = self.bnrun("--detach", "-e", "gate.wait(); print('late')")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1229,10 +1243,10 @@ class BndbOpenHangTest(BridgeFixture):
         other = self.path("other.bndb")
         self.assertEqual(self.run_bndb(other)[1]["result"], other)
         refused = self.run_bndb(stuck)[1]
-        self.assertIn("has been stuck inside Binary Ninja", refused["error"])
+        self.assertIn("is still opening inside Binary Ninja", refused["error"])
         self.assertEqual(self.opened.count(stuck), 1)
         status = self.bnrun("--status").stdout
-        self.assertIn("stuck opening: %s" % stuck, status)
+        self.assertIn("still opening: %s" % stuck, status)
         # the open finishing later caches its view
         self.release.set()
         for _ in range(100):
@@ -1493,6 +1507,8 @@ class BundledScriptsTest(BridgeFixture):
         r = self.run_tool("--bndb", self.db, "R:0x1004:bad", "--save", tool=BNANNOTATE)
         self.assertEqual(r.returncode, 1)
         self.assertEqual(self.view().saved, 1)      # failed edits: no save
+        r = self.run_tool("annotate", "--", "--save", "R:0x1000:x")    # UI view: no save_bndb
+        self.assertIn("--save needs a --bndb run", r.stderr)
         r = self.run_tool("R:0x1000:x", "--save", tool=BNANNOTATE)
         self.assertEqual(r.returncode, 2)
         self.assertIn("--save needs --bndb", r.stderr)

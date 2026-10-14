@@ -218,10 +218,25 @@ bnrun --bndb $DB decompile -- 0x10014fed0 > nhv_proc.hlil # un-skip if needed, p
   writes it to OUT. OUT must be absolute: scripts run inside Binary Ninja, whose working
   directory isn't yours. Redirecting stdout avoids that.
 
+**Heavy loads are not isolated by the lanes.** Lanes only order the Python threads; every
+view still shares Binary Ninja's native core (analysis workers, file and database locks). A big
+`binaryninja.load()` + analysis + `create_database()` on `--parallel` can starve, or deadlock
+against, a serialized `--bndb` first open of another big database (seen with a 51 MB
+kernelcache load against a 1.23 GB `.bndb` open: three threads parked on each other). Before a
+heavy load or a big first open, check `--status` for the other kind and announce it to sessions
+sharing the instance; always give both a `--timeout`. For a huge raw binary, prefer
+`bnrun --detach --bndb RAW --timeout N -e 'result = len(list(bv.functions))'` (one job: load,
+analyse, cache; `--status` shows `opening the bndb ... for Ns` while it works), then
+`--bndb-save` to persist it -- over one blocking parallel script that does load, analysis and
+save. Backgrounded `bnrun`s share the session's id: cancel those by `--cancel RUN_ID`, not by
+session.
+
 The scripts work on any view, not only `--bndb` (`--view` with the usage lock, too). For
 annotations, `bnannotate` saves typing: arguments shaped like `R:`/`D:`/`C:` (and everything
-after `--`) are directives, all others go to `bnrun`; `--save` runs `bnrun --bndb-save` when
-the edits succeeded.
+after `--`) are directives, all others go to `bnrun`; `--save` (`--bndb` only) saves the
+`.bndb` inside the same job once every edit is applied (`annotate -- --save ...`; scripts of a
+`--bndb` run get `save_bndb()` for this), so a client dying between edits and save can't leave
+them applied but unsaved.
 
 ```sh
 bnannotate --bndb $DB --save R:0x10014fed0:nhv_proc "C:0x10014fed0:called once per voice"
@@ -269,6 +284,7 @@ bnrun --status --json             # the same as JSON: what scripts and watchers 
 bnrun --timeout 60 script.py      # the bridge cancels the script after 60 s of running
 bnrun --cancel                    # cancel this session's running scripts (both lanes)
 bnrun --cancel --force            # cancel all running scripts (also other sessions')
+bnrun --cancel RUN_ID             # just that job (also while queued: it won't start)
 ```
 
 - **Ctrl-C** (or SIGTERM, e.g. a tool timeout killing `bnrun`) while `bnrun` waits cancels that

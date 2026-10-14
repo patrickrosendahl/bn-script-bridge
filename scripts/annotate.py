@@ -5,10 +5,11 @@ Directives, one per argument (quote a comment to keep its spaces):
   D:ADDR:NAME     define/rename the data symbol at ADDR
   C:ADDR:TEXT     set the comment at ADDR (replaces it; the old text is printed)
 ADDR is hex, with or without 0x. All directives are checked first (syntax, function exists,
-address valid); if any is bad nothing is applied. Edits live in RAM until saved: for a --bndb
-view run `bnrun --bndb-save` afterwards. Example:
+address valid); if any is bad nothing is applied. Edits live in RAM until saved: --save (first
+argument, --bndb runs only) saves the .bndb in the same job once all edits are applied, so a
+client that dies meanwhile can't leave them unsaved. Example:
 
-  bnrun --bndb /abs/x.bndb annotate -- R:0x10014fed0:nhv_proc "C:0x10014fed0:called per voice"
+  bnrun --bndb /abs/x.bndb annotate -- --save R:0x10014fed0:nhv_proc "C:0x10014fed0:called per voice"
 """
 import sys
 
@@ -59,11 +60,15 @@ def apply(kind, addr, text):
     return "%#x comment set%s" % (addr, " (was: %s)" % was if was else "")
 
 
-if not argv[1:]:
+save = argv[1:2] == ["--save"]
+items = argv[2:] if save else argv[1:]
+if save and "save_bndb" not in globals():
+    sys.exit("annotate: --save needs a --bndb run (save a UI view from Binary Ninja)")
+if not items:
     sys.exit("annotate: no directives (see the docstring: R:ADDR:NAME, D:ADDR:NAME, "
              "C:ADDR:TEXT)")
 directives, errors = [], []
-for item in argv[1:]:
+for item in items:
     try:
         d = parse(item)
         check(*d)
@@ -77,3 +82,8 @@ if errors:
              % (len(errors), "" if len(errors) == 1 else "s"))
 for d in directives:
     print("%s %s" % (d[0], apply(*d)))
+if save:
+    try:
+        print("saved " + save_bndb())
+    except Exception as e:  # noqa: BLE001
+        sys.exit("annotate: edits applied but NOT saved (%s); retry with bnrun --bndb-save" % e)

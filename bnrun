@@ -10,7 +10,7 @@
     bnrun --jobs                                       (this session's jobs + lost ones)
     bnrun --requeue RUN_ID ...|all [--force]           (rerun lost jobs, then wait for them)
     bnrun --forget RUN_ID ...|all                      (drop lost jobs)
-    bnrun --cancel [--force]                           (cancel running scripts)
+    bnrun --cancel [RUN_ID] [--force]                  (cancel running scripts, or one job)
     bnrun --lock [--purpose TEXT] [--ttl MINUTES]      (take or renew for this session)
     bnrun --unlock [--force]
     bnrun --bndb-list                                  (cached headless views)
@@ -162,8 +162,9 @@ def main() -> int:
     lock.add_argument("--status", action="store_true", help="show the usage lock")
     lock.add_argument("--lock", action="store_true", help="take or renew the lock")
     lock.add_argument("--unlock", action="store_true", help="release this session's lock")
-    lock.add_argument("--cancel", action="store_true", help="cancel this session's running "
-                      "scripts (with none: all running ones, as lock holder or with --force)")
+    lock.add_argument("--cancel", nargs="?", const=True, metavar="RUN_ID", help="cancel this "
+                      "session's running scripts (with none: all running ones, as lock holder "
+                      "or with --force); with RUN_ID just that job, also while queued")
     lock.add_argument("--bndb-list", action="store_true", help="list the cached headless views")
     lock.add_argument("--bndb-save", nargs="?", const="", metavar="PATH", help="save cached "
                       "view(s) into their .bndb (all when PATH is omitted)")
@@ -546,8 +547,12 @@ def lost_command(args) -> int:
 
 
 def cancel_command(args) -> int:
-    status, reply = call("/cancel", {"session": args.session, "force": args.force},
-                         passthrough=(403, 409))
+    run_id = args.cancel if isinstance(args.cancel, str) else None
+    status, reply = call("/cancel", {"session": args.session, "force": args.force,
+                                     "run_id": run_id}, passthrough=(403, 409))
+    if status == 200 and reply.get("pending"):
+        print("cancel sent: job %s isn't running; it won't start" % run_id)
+        return 0
     if status == 200:
         for run in reply.get("cancelled_runs") or [reply["cancelled"]]:
             print("cancel sent: %s" % describe_run(run))
