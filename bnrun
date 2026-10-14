@@ -34,6 +34,9 @@ serialized run, also as sys.argv; --env K=V forwards environment variables (give
 merged into os.environ for a serialized run; restored after). Parallel scripts overlap, so they
 get the bare `argv`/`env` names only.
 
+Take the usage lock only for the UI views (the tabs open in Binary Ninja): bv/bvs without
+--bndb, --view, --main-thread, saving a database a UI tab holds. --bndb and --parallel runs don't
+need it -- and since a held lock refuses every other session's runs, release it right after.
 UI views need the usage lock: only a serialized script of the session holding the lock (bnrun
 --lock) gets `bv` (the view whose filename contains --view SUBSTRING, or the one active in the
 UI) and `bvs` (all views open in the UI); --view and --main-thread are refused without the lock.

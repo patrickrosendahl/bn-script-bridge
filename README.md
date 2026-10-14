@@ -96,7 +96,22 @@ bnrun --unlock --force                        # clear another session's stale lo
 ```
 
 The lock applies to both script lanes: while another session holds it, your scripts
-(parallel included) are refused with exit 3.
+(parallel and `--bndb` included) are refused with exit 3.
+
+### When you need the lock
+
+Only for the shared UI state -- what is open in the Binary Ninja window:
+
+| Needs the lock | Doesn't |
+|---|---|
+| `bv`/`bvs` of the UI tabs (any run without `--bndb`) | `--bndb` runs, including edits and `save_bndb()` |
+| `--view SUBSTR`, `--main-thread` | `--parallel` scripts on their own `binaryninja.load()` views |
+| editing/saving a database open in a UI tab | `--status`, `--jobs`, `--wait`, `--bndb-list` |
+| MCP tools that switch the active view, edit or save | `bnrestart` (takes it itself) |
+
+Because a held lock refuses **every** run of every other session, take it right before the UI
+work and `--unlock` right after; don't hold it across long `--bndb` or `--parallel` batches,
+which don't need it. Most analysis is best done through `--bndb` and needs no lock at all.
 
 ### UI views need the lock
 
