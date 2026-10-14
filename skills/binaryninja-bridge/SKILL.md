@@ -77,6 +77,7 @@ $BNRUN --view f -e 'fn = bv.get_functions_by_name("send")[0]; result = sorted({c
 $BNRUN --view f -e 'result = [(hex(s.start), s.value) for s in bv.strings if "http" in s.value.lower()]'
 $BNRUN --view f -e 'import struct; result = struct.unpack("<I", bv.read(0x402000, 4))[0]'      # decode in-script, never hand-transcribe blobs
 ```
+`fn.hlil` on a function BN skipped (`fn.analysis_skipped`, huge ones) forces its analysis in one native call that ignores `--timeout` until it returns (529 blocks: >120 s). In loops, skip those (`if fn.analysis_skipped: continue`); for one you need, use the bundled `decompile` with a generous `--timeout`.
 Recipe shape off (API drift) → probe it (`result = type(x)`, `dir(x)`) instead of guessing.
 
 ## Annotate + save
