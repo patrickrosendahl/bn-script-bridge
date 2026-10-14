@@ -122,7 +122,8 @@ def main() -> int:
                       % (hung.get("stuck_for", 0), hung.get("path")))
             # bvs (the UI views) are only given to the lock holder's scripts
             held_before = bool(lock.get("locked")) and not locked_by_other
-            locked = bnrun("--lock", "--purpose", "bnrestart: saving views and restarting")
+            # exclusive: no other session's --bndb/--parallel run may start while it saves
+            locked = bnrun("--lock", "--exclusive", "--purpose", "bnrestart: saving views and restarting")
             TOOK_LOCK = locked.returncode == 0 and not held_before
             if locked.returncode != 0:
                 print("bnrestart: couldn't take the usage lock: %s"

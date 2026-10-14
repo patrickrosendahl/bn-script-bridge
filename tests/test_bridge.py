@@ -636,11 +636,26 @@ class ParallelTest(BridgeFixture):
 
     def test_lock_rules_apply_to_parallel(self):
         self.hold_lock("sess-fe")
-        status, reply = self.request("POST", "/run", {"code": "pass", "parallel": True,
+        # another session's parallel run goes ahead (no UI views), its plain run waits
+        status, reply = self.request("POST", "/run", {"code": "result = len(bvs)", "parallel": True,
                                                       "session": "sess-audio"})
+        self.assertEqual((status, reply["ok"]), (200, False))
+        self.assertIn("UIViewsUnavailable", reply["error"])       # ran, without UI views
+        status, reply = self.request("POST", "/run", {"code": "pass", "session": "sess-audio"})
         self.assertEqual(status, 423)
+        self.assertIn("--bndb and --parallel runs (no UI views) may still run", reply["error"])
+        r = self.bnrun("--parallel", "--session", "sess-audio", "-e", "pass")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # renewing the lock leaves it as it was; --exclusive refuses parallel runs too
+        r = self.bnrun("--lock", "--exclusive", "--session", "sess-fe")
+        self.assertIn("locked exclusively by", r.stdout)
+        self.bnrun("--lock", "--session", "sess-fe")
+        self.assertTrue(self.bridge.lock.status()["exclusive"])
         r = self.bnrun("--parallel", "--session", "sess-audio", "-e", "pass")
         self.assertEqual(r.returncode, 3)
+        self.assertEqual(self.request("POST", "/unlock", {"session": "sess-fe"})[0], 200)
+        self.hold_lock("sess-fe")
+        self.assertFalse(self.bridge.lock.status()["exclusive"])   # a new lock: not exclusive
         # the holder's parallel script runs next to its own serialized one (no self-deadlock)
         t, box = self.run_async({"code": GATED, "session": "sess-fe"})
         self.wait_for(lambda st: st["running"] and st["running"]["state"] == "running",
@@ -883,9 +898,13 @@ class BndbCacheTest(BridgeFixture):
             self.assertIn(bridge_server.BNDB_NO_UI, reply["error"])
         status, reply = self.run_bndb(path)          # no lock held: still runs
         self.assertEqual((status, reply["ok"]), (200, True))
-        self.hold_lock("other")                      # another session holds it: 423
+        self.hold_lock("other")                      # another session holds it: still runs
         status, reply = self.run_bndb(path)
+        self.assertEqual((status, reply["ok"]), (200, True))
+        self.request("POST", "/lock", {"session": "other", "exclusive": True})
+        status, reply = self.run_bndb(path)          # exclusive: 423
         self.assertEqual(status, 423)
+        self.assertIn("locked exclusively by", reply["error"])
 
     def test_not_found_and_bad_types(self):
         status, reply = self.run_bndb(os.path.join(self.tmp.name, "missing.bndb"))
@@ -1008,7 +1027,10 @@ class BndbCacheTest(BridgeFixture):
             self.request("POST", "/cancel", {"force": True})
             t.join(10)
         self.assertFalse(t.is_alive())
-        self.hold_lock("other")
+        self.hold_lock("other")                      # a plain lock: cached views are no UI
+        status, reply = self.request("POST", "/bndb", {"action": "save"})
+        self.assertEqual(status, 200)
+        self.request("POST", "/lock", {"session": "other", "exclusive": True})
         status, reply = self.request("POST", "/bndb", {"action": "save"})
         self.assertEqual(status, 423)
 

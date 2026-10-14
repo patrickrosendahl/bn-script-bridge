@@ -18,7 +18,7 @@ Cold material; SKILL.md covers the hot path. Read the section you need.
 - A `.bndb` opens its database (renames included); a raw binary path is analysed once and `--bndb-save` then creates `<file>.bndb` beside it. `bnrun` waits for `--bndb` runs as long as they take (see Jobs); `--bndb-save` of a raw binary writes a whole database (300 s).
 - `--bndb-save`/`--bndb-close` take an optional PATH (all cached views without one) and are refused while a serialized script runs. Trap: `--bndb-save foo.py` takes `foo.py` as the PATH -- management commands run no script.
 - **One handle per `.bndb`**: opening a database twice (cached view + UI tab or MCP open) gives two handles that both look writable, but then saves fail on both until one closes unsaved. The bridge refuses a `--bndb` open of a file already open in the UI, and the MCP proxy refuses opening a cached one. Close the other side first.
-- Stop/quit closes the cache **unsaved**; `bnrestart` saves it first. While another session holds the lock, `--bndb` runs are refused (exit 3) like any other.
+- Stop/quit closes the cache **unsaved**; `bnrestart` saves it first. `--bndb` runs (and `--bndb-save`/`--bndb-close`) go ahead while another session holds a normal lock; an exclusive one (`--lock --exclusive`, used by `bnrestart`) refuses them (exit 3).
 
 ## Disassembly, per line
 `fn.instructions` yields `(tokens, length)` tuples per the API version — if the shape is off, probe it in a throwaway script (`result = type(...)`, `dir(...)`) rather than guessing; the real API is right there:

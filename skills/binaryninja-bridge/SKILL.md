@@ -49,14 +49,15 @@ Opens the file headlessly once, caches it and hands it to every later run as `bv
 
 **No lock for** `--bndb` runs (own cached headless view, incl. edits + `save_bndb()`), `--parallel` scripts on their own `binaryninja.load()` views, or `--status`/`--jobs`/`--wait`. Prefer these: most analysis never needs the lock. `bnrestart` takes it by itself.
 
-**Why it matters to hold it briefly:** while *any* session holds the lock, **every** run of every other session is refused (exit 3) -- `--bndb` and `--parallel` included. So a lock held "just in case", or across a long `--bndb` batch, blocks everyone for nothing.
+**Someone else holds it?** Your `--bndb` and `--parallel` runs (and `--bndb-save`/`--bndb-close`) still go ahead; only runs that could use the UI views wait (exit 3). An **exclusive** lock (`--lock --exclusive`, e.g. `bnrestart` while saving and quitting) refuses those too. Going ahead next to a holder shares BN's native core with it: keep heavy loads announced (see Lanes).
+**Hold it briefly:** a held lock still makes other sessions' UI work wait, so take it right before the UI work and release it right after -- never across a long `--bndb`/`--parallel` batch.
 ```sh
 $BNRUN --lock --purpose "renaming in the UI tab of foo"   # take/renew (ttl 5 min; your runs renew it)
 $BNRUN --view foo -e '...'                                # the UI work
 $BNRUN --unlock                                           # release right after, before anything long
 ```
 - Without the lock, `bv`/`bvs` raise `UIViewsUnavailable` and `--view`/`--main-thread` are refused (exit 2).
-- Locked by another session → wait or message them via `SendMessage` (the refusal shows holder, purpose and expiry). Stale lock: `--unlock --force` or `--cancel --force` only after asking.
+- Need the UI views while another session holds the lock → wait or message them via `SendMessage` (the refusal shows holder, purpose and expiry), or do the work through `--bndb` instead. Stale lock: `--unlock --force` or `--cancel --force` only after asking.
 - `--timeout N` on every long run (cancellation lands only between bytecodes; a long native call ignores it until it returns).
 
 ## Bundled scripts (`/Users/patrick/dev/bn-script-bridge/scripts/`) -- use these, don't rewrite them

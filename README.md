@@ -90,13 +90,17 @@ by hand, and a Binary Ninja restart clears it too.
 ```sh
 bnrun --status                                # "free" (exit 0) or "locked by ..." (exit 3)
 bnrun --lock --purpose "typing ctl.bin"       # take or renew (exit 3 if another session has it)
-bnrun -e '...'                                # other sessions' scripts get exit 3 meanwhile
+bnrun --lock --exclusive --purpose "restart"  # also refuse others' --bndb/--parallel runs
+bnrun -e '...'                                # other sessions' UI-lane runs get exit 3 meanwhile
 bnrun --unlock                                # release when done
 bnrun --unlock --force                        # clear another session's stale lock
 ```
 
-The lock applies to both script lanes: while another session holds it, your scripts
-(parallel and `--bndb` included) are refused with exit 3.
+While another session holds the lock, your `--bndb` and `--parallel` runs (and
+`--bndb-save`/`--bndb-close`) still go ahead: they touch no UI view. Everything else -- any run
+that could use the UI views -- is refused with exit 3 until the lock is released. An
+**exclusive** lock (`--lock --exclusive`, e.g. by `bnrestart` while it saves and quits) refuses
+those too; renewing a lock keeps its mode, a new one starts non-exclusive.
 
 ### When you need the lock
 
@@ -109,9 +113,11 @@ Only for the shared UI state -- what is open in the Binary Ninja window:
 | editing/saving a database open in a UI tab | `--status`, `--jobs`, `--wait`, `--bndb-list` |
 | MCP tools that switch the active view, edit or save | `bnrestart` (takes it itself) |
 
-Because a held lock refuses **every** run of every other session, take it right before the UI
-work and `--unlock` right after; don't hold it across long `--bndb` or `--parallel` batches,
-which don't need it. Most analysis is best done through `--bndb` and needs no lock at all.
+A held lock still makes other sessions' UI work (and plain runs) wait, so take it right
+before the UI work and `--unlock` right after; don't hold it across long `--bndb` or
+`--parallel` batches, which don't need it. Most analysis is best done through `--bndb` and
+needs no lock at all. Running next to a lock holder shares Binary Ninja's native core with it:
+a heavy load can slow its work down (see "Heavy loads are not isolated by the lanes").
 
 ### UI views need the lock
 
@@ -127,8 +133,8 @@ Otherwise:
 
 Scripts that only create their own views through the API (`BinaryViewType[...].create(
 BinaryView.open(path))`, `BinaryView.open`, `binaryninja.load`, then `bv.file.close()` -- a `BinaryView` has no
-`close()`) don't need you to hold the lock. Like every run, they are still refused (exit 3)
-while another session holds it.
+`close()`) don't need the lock: run them with `--parallel`, and they go ahead even while
+another session holds it (unless it is exclusive).
 
 **Limitation:** this is enforced in the script namespace and otherwise relies on convention. A
 script can still reach UI views by other paths (`binaryninjaui.UIContext`, ...); don't.
@@ -191,8 +197,8 @@ Rules: `--bndb` runs in the serialized lane (cached views are shared, so runs us
 not overlap) but needs **no usage lock** — it touches no UI view — and can't be combined with
 `--view`, `--main-thread` or `--parallel`. `bvs` stays a placeholder that raises with the
 reason. The first open of a big `.bndb` takes a while (30k functions ≈ 85 s) — later runs are
-instant; `bnrun` waits as long as the run takes (see [Jobs](#jobs)). While another session holds
-the lock, `--bndb` runs are refused like any other (exit 3).
+instant; `bnrun` waits as long as the run takes (see [Jobs](#jobs)). `--bndb` runs go ahead
+while another session holds a normal lock; only an exclusive one refuses them (exit 3).
 
 The open counts against `--timeout`, and `--cancel` works while it runs (status: `opening the
 bndb ... for Ns`). The open is a native call that can't be interrupted (a database also open

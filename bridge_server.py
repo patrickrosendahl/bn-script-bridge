@@ -314,6 +314,7 @@ class UsageLock:
         self.since = 0.0
         self.expires = 0.0
         self.ttl = DEFAULT_LOCK_TTL
+        self.exclusive = False      # refuse other sessions' --bndb/--parallel runs too
 
     def _expire(self) -> None:
         if self.holder is not None and self.clock() >= self.expires:
@@ -327,7 +328,7 @@ class UsageLock:
         now = self.clock()
         return {"locked": True, "session": self.holder, "name": self.name,
                 "purpose": self.purpose, "held_for": int(now - self.since),
-                "expires_in": max(0, int(self.expires - now))}
+                "expires_in": max(0, int(self.expires - now)), "exclusive": self.exclusive}
 
     def _is_holder(self, session: Optional[str]) -> bool:
         return (self.holder is not None and isinstance(session, str)
@@ -339,8 +340,10 @@ class UsageLock:
             return self._status()
 
     def acquire(self, session: str, name: str = "", purpose: str = "",
-                ttl: Optional[float] = None) -> Tuple[bool, Dict[str, Any]]:
-        """(True, status) if taken or renewed by the holder, else (False, holder's status)."""
+                ttl: Optional[float] = None,
+                exclusive: Optional[bool] = None) -> Tuple[bool, Dict[str, Any]]:
+        """(True, status) if taken or renewed by the holder, else (False, holder's status).
+        exclusive: True/False sets it, None keeps it (a new lock: not exclusive)."""
         ttl = min(max(float(ttl or DEFAULT_LOCK_TTL), 1.0), MAX_LOCK_TTL)
         with self.mutex:
             self._expire()
@@ -348,9 +351,12 @@ class UsageLock:
             if self.holder is None:
                 self.holder, self.since = session, now
                 self.name, self.purpose = name, purpose
+                self.exclusive = bool(exclusive)
                 event = "locked"
             elif self._is_holder(session):
                 self.name, self.purpose = name or self.name, purpose or self.purpose
+                if exclusive is not None:
+                    self.exclusive = bool(exclusive)
                 event = "renewed"
             else:
                 return False, self._status()
@@ -381,14 +387,17 @@ class UsageLock:
             self._expire()
             return self._is_holder(session)
 
-    def check_use(self, session: Optional[str]) -> Tuple[bool, Dict[str, Any]]:
-        """(allowed, status): free, or used by the holder (which renews the lock)."""
+    def check_use(self, session: Optional[str],
+                  headless: bool = False) -> Tuple[bool, Dict[str, Any]]:
+        """(allowed, status): free, or used by the holder (which renews the lock). headless
+        (a run or command that touches no UI view: --bndb, --parallel, cached-view save/close)
+        is also allowed for others while the lock isn't exclusive -- without renewing it."""
         with self.mutex:
             self._expire()
             if self.holder is None:
                 return True, self._status()
             if not self._is_holder(session):
-                return False, self._status()
+                return headless and not self.exclusive, self._status()
             self.expires = self.clock() + self.ttl
             return True, self._status()
 
@@ -397,7 +406,8 @@ def describe(status: Dict[str, Any]) -> str:
     if not status.get("locked"):
         return "free"
     who = status.get("name") or status["session"][:8]
-    return "locked by %s%s (held %ds, expires in %ds; session %s)" % (
+    return "locked%s by %s%s (held %ds, expires in %ds; session %s)" % (
+        " exclusively" if status.get("exclusive") else "",
         who, (": " + status["purpose"]) if status.get("purpose") else "",
         status["held_for"], status["expires_in"], status["session"])
 
@@ -715,8 +725,10 @@ class ScriptBridge:
                     ttl = float(req["ttl"]) if req.get("ttl") is not None else None
                 except (TypeError, ValueError):
                     return _reply_json(self, 400, {"ok": False, "error": "bad request: bad ttl"})
+                exclusive = req.get("exclusive")
                 ok, status = bridge.lock.acquire(session.strip(), str(req.get("name") or ""),
-                                                 str(req.get("purpose") or ""), ttl)
+                                                 str(req.get("purpose") or ""), ttl,
+                                                 None if exclusive is None else bool(exclusive))
                 if not ok:
                     return _reply_json(self, 409, {"ok": False, "lock": status,
                                                    "error": "Binary Ninja is " + describe(status)})
@@ -735,7 +747,7 @@ class ScriptBridge:
                 if action not in ("save", "close"):
                     return _reply_json(self, 400, {"ok": False, "error": "bad request: action "
                                                    'must be "save" or "close"'})
-                allowed, status = bridge.lock.check_use(req.get("session"))
+                allowed, status = bridge.lock.check_use(req.get("session"), headless=True)
                 if not allowed:
                     return _reply_json(self, 423, {"ok": False, "lock": status,
                                                    "error": "Binary Ninja is " + describe(status)})
@@ -797,9 +809,14 @@ class ScriptBridge:
                                 or not all(isinstance(k, str) and isinstance(v, str)
                                            for k, v in env.items())):
             return bad("bad request: env must be an object mapping names to string values")
-        allowed, status = self.lock.check_use(req.get("session"))
+        # --bndb and --parallel runs touch no UI view: other sessions may run them while the
+        # lock is held (unless it is exclusive); everything else waits for the holder.
+        headless = bool(bndb or parallel) and not (view or main_thread)
+        allowed, status = self.lock.check_use(req.get("session"), headless=headless)
         if not allowed:
-            return bad("Binary Ninja is " + describe(status), 423, lock=status)
+            return bad("Binary Ninja is " + describe(status) + (
+                "" if headless else "; --bndb and --parallel runs (no UI views) may still run "
+                "unless the lock is exclusive"), 423, lock=status)
         if (view or main_thread) and not self.lock.holds(req.get("session")):
             return bad(NEED_LOCK, 409, lock=status)
         timeout = req.get("timeout")

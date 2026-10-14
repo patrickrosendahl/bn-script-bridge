@@ -36,14 +36,15 @@ get the bare `argv`/`env` names only.
 
 Take the usage lock only for the UI views (the tabs open in Binary Ninja): bv/bvs without
 --bndb, --view, --main-thread, saving a database a UI tab holds. --bndb and --parallel runs don't
-need it -- and since a held lock refuses every other session's runs, release it right after.
+need it, and other sessions' --bndb/--parallel runs go ahead while you hold it; their other
+runs wait (exit 3), so release it right after. --lock --exclusive refuses those too.
 UI views need the usage lock: only a serialized script of the session holding the lock (bnrun
 --lock) gets `bv` (the view whose filename contains --view SUBSTRING, or the one active in the
 UI) and `bvs` (all views open in the UI); --view and --main-thread are refused without the lock.
 Without it, `bv`/`bvs` raise UIViewsUnavailable when used. Scripts that only create their own
 views (BinaryViewType[...].create(BinaryView.open(path)), binaryninja.load; close with
-bv.file.close()) don't need you to hold the lock -- but while another session holds it, every
-run is refused (exit 3), --parallel and --bndb ones included.
+bv.file.close()) don't need the lock and run even while another session holds it (unless
+it is exclusive).
 
 --bndb PATH opens that file headlessly (a .bndb opens its database and carries renames; a raw
 binary is analysed once), caches the view and hands it to the script as `bv` -- no usage lock
@@ -182,6 +183,8 @@ def main() -> int:
     lock.add_argument("--forget", nargs="+", metavar="RUN_ID", help="drop lost jobs (or all)")
     ap.add_argument("--purpose", default="", help="with --lock: what you are doing")
     ap.add_argument("--ttl", type=float, help="with --lock: minutes until it expires (default 5)")
+    ap.add_argument("--exclusive", action="store_true", help="with --lock: also refuse other "
+                    "sessions' --bndb and --parallel runs (e.g. before a restart)")
     ap.add_argument("--force", action="store_true", help="with --unlock: release someone "
                     "else's lock (stale locks); with --cancel: cancel someone else's script; "
                     "with --requeue: also rerun jobs that were running when they were lost")
@@ -428,7 +431,8 @@ def lock_command(args) -> int:
             return 2
         status, reply = call("/lock", {"session": args.session, "name": args.name,
                                        "purpose": args.purpose,
-                                       "ttl": args.ttl * 60 if args.ttl else None})
+                                       "ttl": args.ttl * 60 if args.ttl else None,
+                                       "exclusive": True if args.exclusive else None})
         if status == 409:
             print("bnrun: Binary Ninja is %s" % describe(reply["lock"]), file=sys.stderr)
             return 3
