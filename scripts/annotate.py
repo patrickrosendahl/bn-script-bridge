@@ -63,7 +63,10 @@ def apply(kind, addr, text):
 save = argv[1:2] == ["--save"]
 items = argv[2:] if save else argv[1:]
 if save and "save_bndb" not in globals():
-    sys.exit("annotate: --save needs a --bndb run (save a UI view from Binary Ninja)")
+    sys.exit("annotate: --save needs a --bndb run (save a UI view from Binary Ninja). Already "
+             "a --bndb run? Then Binary Ninja still runs a bridge plugin from before "
+             "2026-10-14 (no save_bndb): restart it to load the new one, or drop --save and run "
+             "bnrun --bndb-save afterwards")
 if not items:
     sys.exit("annotate: no directives (see the docstring: R:ADDR:NAME, D:ADDR:NAME, "
              "C:ADDR:TEXT)")
