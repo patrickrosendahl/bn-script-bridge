@@ -32,7 +32,7 @@ $BNRUN --bndb /path/target.bndb -e 'result = len(list(bv.functions))'
 $BNRUN --bndb-save            # write renames etc. into the .bndb -- after each batch of edits
 $BNRUN --bndb-list            # cached views (also in --status); --bndb-close frees them
 ```
-Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no usage lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Details: `reference.md`.
+Status `opening the bndb ... for Ns` that keeps climbing = a hung open (often the file is also open in a UI tab): `--timeout`/`--cancel` abandon it and free the lane (see `reference.md`). Opens the file headlessly once, caches it and hands it to every later run as `bv` -- instant after the first open (big `.bndb` ~1 min, not a hang), no usage lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Details: `reference.md`.
 
 ## Usage lock (UI views are shared — take it before touching them)
 ```sh

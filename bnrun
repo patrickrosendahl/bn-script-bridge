@@ -343,6 +343,8 @@ def render(status, reply, args) -> int:
             text += rendered if (not text or text.endswith("\n")) else "\n" + rendered
         if reply.get("error") == "cancelled":
             print("bnrun: script cancelled (by %s)" % reply.get("cancelled_by"), file=sys.stderr)
+            if reply.get("detail"):
+                print("bnrun: %s" % reply["detail"], file=sys.stderr)
         elif reply.get("error"):
             sys.stderr.write(reply["error"])
     if args.max_out is not None and len(text) > args.max_out:

@@ -163,6 +163,10 @@ class ScriptCancelled(BaseException):
     """Raised inside a running script to cancel it (BaseException: `except Exception` misses it)."""
 
 
+class OpenAbandoned(LookupError):
+    """A --bndb open given up on (timeout or cancel) while it still runs in Binary Ninja."""
+
+
 class UIViewsUnavailable(RuntimeError):
     """Raised when a script uses `bv`/`bvs` without being allowed UI views."""
 
@@ -443,13 +447,17 @@ class Run:
         self.reply: Optional[Dict[str, Any]] = None
         self.done = threading.Event()
         self.finished_at: Optional[float] = None
+        self.opening_since: Optional[float] = None   # opening its --bndb (before the script)
+        self.open_seconds = 0.0                      # spent opening; counts against timeout
 
     def state_name(self) -> str:
         if self.reply is not None:
             return "done"
         if not self.in_lane:
             return "queued"
-        return "running" if self.started else "starting"
+        if self.started:
+            return "running"
+        return "opening" if self.opening_since else "starting"
 
     def status(self, full: bool = False) -> Dict[str, Any]:
         """full adds the run_id (which lets anyone cancel the run or fetch its reply)."""
@@ -461,6 +469,8 @@ class Run:
                   "queued_for": int((self.started or now) - self.queued_at),
                   "running_for": int((self.finished_at or now) - self.started)
                   if self.started else 0,
+                  "opening_for": int(now - self.opening_since)
+                  if self.opening_since and not self.started else 0,
                   "cancel_requested": self.cancel_by}
         if full:
             status["run_id"] = self.run_id
@@ -488,6 +498,9 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
         extra.append("timeout %gs" % status["timeout"])
     if status.get("cancel_requested"):
         extra.append("cancel requested: %s" % status["cancel_requested"])
+    if status.get("state") == "opening":
+        return "opening the bndb for script %r for %ds (%s)" % (
+            status["label"], status.get("opening_for", 0), ", ".join(extra))
     if status.get("state") == "queued":
         return "queued script %r for %ds (%s)" % (status["label"], status.get("queued_for", 0),
                                                   ", ".join(extra))
@@ -518,6 +531,10 @@ def describe_runs(reply: Dict[str, Any]) -> str:
         lines.append("queued: %d serialized, %d parallel" % (queued, pqueued))
         lines += ["  " + describe_run(r) for r in reply.get("jobs") or []
                   if r.get("state") == "queued"]
+    for hung in reply.get("bndb_hung") or []:
+        lines.append("stuck opening: %s for %ds (abandoned; --bndb runs of it are refused "
+                     "until it finishes or Binary Ninja restarts)" % (hung["path"],
+                                                                      hung["stuck_for"]))
     if reply.get("lost"):
         lines.append("lost: %d job%s whose Binary Ninja stopped before they finished "
                      "(bnrun --jobs; --requeue ID|all, --forget ID|all)"
@@ -579,6 +596,7 @@ class ScriptBridge:
         self.bndb_close = bndb_close
         self.bndb_mutex = threading.Lock()
         self.bndb_views: Dict[str, Any] = {}    # abspath -> cached view handle
+        self.bndb_hung: Dict[str, float] = {}   # abspath -> since: an abandoned, unfinished open
         self.run_mutex = threading.Lock()    # serialized lane: one script at a time
         self.state = threading.Lock()        # guards current, queued, parallel*, cancelled_ids
         self.slot_free = threading.Condition(self.state)   # a parallel slot or cancel happened
@@ -804,6 +822,7 @@ class ScriptBridge:
                     "parallel_queued": self.parallel_queued,
                     "max_parallel": self.limit(),
                     "bndb": self.bndb_status(),
+                    "bndb_hung": self.bndb_hung_status(),
                     "jobs": [r.status() for r in self.jobs.values() if r.reply is None],
                     "lost": len(self.lost)}
 
@@ -1089,7 +1108,7 @@ class ScriptBridge:
         headless view for a bndb run. Raises LookupError (bad view filter, or the bndb couldn't
         be opened) or UIViewsUnavailable (view not allowed)."""
         if run.bndb:
-            return dict(self.base_namespace, bv=self._bndb_view(run.bndb),
+            return dict(self.base_namespace, bv=self._bndb_view(run.bndb, run),
                         bvs=NoUIViews("bvs", BNDB_BVS))
         if run.parallel:
             reason = PARALLEL_NO_UI
@@ -1102,27 +1121,87 @@ class ScriptBridge:
         return dict(self.base_namespace, bv=NoUIViews("bv", reason),
                     bvs=NoUIViews("bvs", reason))
 
-    def _bndb_view(self, path: str) -> Any:
+    def _bndb_view(self, path: str, run: Optional[Run] = None) -> Any:
         """The cached headless view for `path`, opening it if needed.
 
         The open runs outside bndb_mutex (it can take minutes), which is safe because bndb runs
         execute only in the serialized lane (enforced by the combo checks in the handler, in
         execute and in bnrun): at most one opener, and management save/close is refused while a
         serialized script runs. A close that passed that 409 gate just before a queued bndb run
-        starts can miss the run's newly opened view -- harmless, the entry stays cached."""
+        starts can miss the run's newly opened view -- harmless, the entry stays cached.
+
+        The open itself is a native call nothing can interrupt (it can deadlock in Binary
+        Ninja's core, e.g. against another handle on the same database), so it runs in a
+        thread of its own while the run waits for it, watching its --timeout (which the open
+        counts against) and --cancel. Either one abandons the open: the run ends as cancelled
+        and frees the lane, the path goes into bndb_hung (further runs on it are refused at
+        once instead of piling up behind it), and an open that does finish later is cached."""
         key = os.path.abspath(path)
         with self.bndb_mutex:
             if key in self.bndb_views:
                 return self.bndb_views[key]
+            if key in self.bndb_hung:
+                raise LookupError(
+                    "an earlier open of %s has been stuck inside Binary Ninja for %ds and was "
+                    "abandoned; refusing to open it again. Usually the file is also open "
+                    "elsewhere (a UI tab, an MCP item): close that, or restart Binary Ninja "
+                    "(bnrestart)" % (key, time.time() - self.bndb_hung[key]))
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def opener():
+            try:
+                box["handle"] = self.bndb_open(key) if self.bndb_open else None
+            except Exception as e:  # noqa: BLE001 -- reported by the waiting run
+                box["error"] = e
+            finally:
+                with self.bndb_mutex:
+                    done.set()
+                    if key in self.bndb_hung:       # its run gave up: keep what it opened
+                        del self.bndb_hung[key]
+                        if box.get("handle") is not None:
+                            self.bndb_views[key] = box["handle"]
+
+        started = time.time()
+        if run is not None:
+            run.opening_since = started
+        threading.Thread(target=opener, daemon=True,
+                         name="bn-script-bridge open %s" % os.path.basename(key)).start()
         try:
-            handle = self.bndb_open(key) if self.bndb_open else None
-        except Exception as e:  # noqa: BLE001 -- report the open failure, don't kill the thread
-            raise LookupError("couldn't open %s: %r" % (key, e)) from e
-        if handle is None:
+            while not done.wait(0.2):
+                why = None
+                if run is not None and run.cancel_by is not None:
+                    why = run.cancel_by
+                elif run is not None and run.timeout and time.time() - started >= run.timeout:
+                    why = run.cancel_by = "timeout after %gs (opening the bndb)" % run.timeout
+                if why is None:
+                    continue
+                with self.bndb_mutex:
+                    if not done.is_set():
+                        self.bndb_hung[key] = started
+                        raise OpenAbandoned(
+                            "abandoned opening %s after %ds (%s); the open goes on inside "
+                            "Binary Ninja (a native call can't be interrupted) and further "
+                            "--bndb runs of it are refused until it finishes. If it never "
+                            "does, the file is likely open elsewhere too (a UI tab): close "
+                            "that, or restart Binary Ninja" % (key, time.time() - started, why))
+        finally:
+            if run is not None:
+                run.open_seconds = time.time() - started
+        if "error" in box:
+            raise LookupError("couldn't open %s: %s" % (key, box["error"])) from box["error"]
+        if box.get("handle") is None:
             raise LookupError("couldn't open %s" % key)
         with self.bndb_mutex:
-            self.bndb_views[key] = handle
-        return handle
+            self.bndb_views[key] = box["handle"]
+        return box["handle"]
+
+    def bndb_hung_status(self) -> List[Dict[str, Any]]:
+        """Abandoned opens still stuck inside Binary Ninja, for GET /run."""
+        now = time.time()
+        with self.bndb_mutex:
+            return [{"path": p, "stuck_for": int(now - since)}
+                    for p, since in sorted(self.bndb_hung.items())]
 
     def bndb_status(self) -> List[Dict[str, Any]]:
         """The cached headless views, for GET /run."""
@@ -1193,6 +1272,8 @@ class ScriptBridge:
             return self._cancelled(run, "")
         try:
             namespace = self._namespace(run, view)
+        except OpenAbandoned as e:
+            return dict(self._cancelled(run, ""), detail=str(e))
         except (LookupError, UIViewsUnavailable) as e:
             return {"ok": False, "stdout": "", "result": None, "error": str(e)}
         # Bare names for every run (race-free); parallel runs don't get the sys.argv /
@@ -1231,7 +1312,8 @@ class ScriptBridge:
                     if run.cancel_by is not None:   # cancelled before it began
                         raise ScriptCancelled()
                     if run.timeout:
-                        run.timer = threading.Timer(run.timeout, self._on_timeout, (run,))
+                        run.timer = threading.Timer(max(run.timeout - run.open_seconds, 0.001),
+                                                    self._on_timeout, (run,))
                         run.timer.daemon = True
                         run.timer.start()
                     if not run.parallel and (run.args or run.env):

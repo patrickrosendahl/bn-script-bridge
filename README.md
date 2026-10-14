@@ -177,6 +177,14 @@ reason. The first open of a big `.bndb` takes a while (30k functions â‰ˆ 85 s) â
 instant; `bnrun` waits as long as the run takes (see [Jobs](#jobs)). While another session holds
 the lock, `--bndb` runs are refused like any other (exit 3).
 
+The open counts against `--timeout`, and `--cancel` works while it runs (status: `opening the
+bndb ... for Ns`). The open is a native call that can't be interrupted (a database also open
+in a UI tab can deadlock it), so either one *abandons* it: the job ends cancelled and frees the
+serialized lane, `--status` shows `stuck opening: PATH`, and further runs on that path are
+refused until the open finishes (its view is then cached) or Binary Ninja restarts. The plugin
+refuses a `--bndb` open of a file a UI tab or MCP item holds (checked on the UI thread, by
+file and original binary), naming where it is open.
+
 Management is refused (409) while a serialized script runs; `--bndb-save` of a raw binary
 writes a whole `.bndb` (300 s timeout). **Stop** (or quitting Binary Ninja) closes the cache
 without saving; `bnrestart` saves it first. Note the `nargs` trap: `bnrun --bndb-save foo.py`

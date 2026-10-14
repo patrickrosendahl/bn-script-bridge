@@ -312,7 +312,8 @@ class CancelTest(BridgeFixture):
                                                           "queued": 0, "parallel": [],
                                                           "parallel_queued": 0,
                                                           "max_parallel": 4, "bndb": [],
-                                                          "jobs": [], "lost": 0})
+                                                          "bndb_hung": [], "jobs": [],
+                                                          "lost": 0})
         status, reply = self.request("POST", "/run", {"code": "result = sum(range(100000))"})
         self.assertEqual((status, reply["ok"], reply["result"]), (200, True, 4999950000))
 
@@ -1186,6 +1187,82 @@ class JobsTest(BridgeFixture):
         self.assertEqual((proc.returncode, out), (0, "done\n"), err)
         self.assertIn("still waiting for job j", err)
         self.assertIn("bridge back", err)
+
+
+class BndbOpenHangTest(BridgeFixture):
+    """A --bndb open stuck inside Binary Ninja: --timeout and --cancel abandon it and free the
+    lane; the path is refused until the open finishes (then its view is cached)."""
+
+    run_async = CancelTest.run_async
+    path = BndbCacheTest.path
+    run_bndb = BndbCacheTest.run_bndb
+
+    def setUp(self):
+        super().setUp()
+        self.opened = []
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+
+        def stuck_open(path):
+            self.opened.append(path)
+            if "stuck" in path:
+                self.release.wait()
+            return CachedView(path)
+        self.bridge.bndb_open = stuck_open
+
+    def test_timeout_covers_the_open_and_frees_the_lane(self):
+        stuck = self.path("stuck.bndb")
+        t, box = self.run_async({"code": "result = 1", "bndb": stuck, "timeout": 0.5})
+        for _ in range(100):
+            running = self.request("GET", "/run")[1]["running"]
+            if running and running["state"] == "opening":
+                break
+            time.sleep(0.01)
+        self.assertEqual(running["state"], "opening")
+        self.assertIn("opening the bndb for script", bridge_server.describe_run(running))
+        t.join(5)
+        reply = box["reply"][1]
+        self.assertEqual((reply["error"], reply["cancelled_by"]),
+                         ("cancelled", "timeout after 0.5s (opening the bndb)"))
+        self.assertIn("abandoned opening %s" % stuck, reply["detail"])
+        # the lane is free: other runs go ahead; the stuck path is refused at once
+        other = self.path("other.bndb")
+        self.assertEqual(self.run_bndb(other)[1]["result"], other)
+        refused = self.run_bndb(stuck)[1]
+        self.assertIn("has been stuck inside Binary Ninja", refused["error"])
+        self.assertEqual(self.opened.count(stuck), 1)
+        status = self.bnrun("--status").stdout
+        self.assertIn("stuck opening: %s" % stuck, status)
+        # the open finishing later caches its view
+        self.release.set()
+        for _ in range(100):
+            if not self.bridge.bndb_hung:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.run_bndb(stuck)[1]["result"], stuck)
+        self.assertEqual(self.opened.count(stuck), 1)
+
+    def test_cancel_lands_during_the_open(self):
+        stuck = self.path("stuck.bndb")
+        t, box = self.run_async({"code": "result = 1", "bndb": stuck, "session": "s",
+                                 "run_id": "r"})
+        for _ in range(100):
+            if (self.request("GET", "/run")[1]["running"] or {}).get("state") == "opening":
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.request("POST", "/cancel", {"session": "s"})[0], 200)
+        t.join(5)
+        self.assertEqual(box["reply"][1]["cancelled_by"], "session s")
+        self.assertIsNone(self.request("GET", "/run")[1]["running"])
+
+    def test_script_timeout_gets_what_the_open_left(self):
+        def slow_open(path):
+            time.sleep(0.6)
+            return CachedView(path)
+        self.bridge.bndb_open = slow_open
+        reply = self.run_bndb(self.path(), code="import time; time.sleep(0.05)\n"
+                              "while True: pass", timeout=1)[1]
+        self.assertEqual(reply["cancelled_by"], "timeout after 1s")
 
 
 class RunScriptExitTest(unittest.TestCase):

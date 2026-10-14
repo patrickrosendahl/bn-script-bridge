@@ -64,25 +64,58 @@ def _namespace(view_filter):
     return {"bv": bv, "bvs": views, "binaryninja": binaryninja, "bn": binaryninja}
 
 
+def _same_file(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.realpath(a) == os.path.realpath(b)
+
+
+def _ui_open_files():
+    """Every path the UI holds open: each file context's filename and, for each tab's view,
+    its filename and original binary. Must run on the main thread."""
+    from binaryninjaui import FileContext
+    names = []
+    for fc in FileContext.getOpenFileContexts() or []:
+        try:
+            names.append(fc.getFilename())
+        except Exception:
+            pass
+    for bv in _open_views()[0]:
+        for attr in ("filename", "original_filename"):
+            try:
+                names.append(getattr(bv.file, attr))
+            except Exception:
+                pass
+    return [n for n in names if n]
+
+
 def _open_elsewhere(path):
     """A message naming where `path` is already open in Binary Ninja (a cached --bndb view,
     or an MCP/UI file context), or None when it isn't. Opening a .bndb twice gives it two
     database handles; both look fully writable, but then saves fail on BOTH lanes until
-    one of the two closes without saving -- edits on that side are lost."""
+    one of the two closes without saving -- edits on that side are lost, and a headless open
+    of a database a UI tab holds can deadlock inside Binary Ninja's core."""
     abs_path = os.path.abspath(path)
     if _bridge is not None and abs_path in _bridge.bndb_views:
         return "%s is already open as a bnrun --bndb cached view" % path
+    box = {}
+
+    def look():
+        try:
+            box["names"] = _ui_open_files()
+        except Exception as e:      # headless / UI not up yet: nothing to compare against
+            box["error"] = e
     try:
-        from binaryninjaui import FileContext
-        for fc in FileContext.getOpenFileContexts() or []:
-            try:
-                name = fc.getFilename()
-            except Exception:
-                continue
-            if name and os.path.abspath(name) == abs_path:
-                return "%s is already open in Binary Ninja (an MCP/UI file)" % path
-    except Exception:
-        pass                      # headless / UI not up yet: nothing to compare against
+        execute_on_main_thread_and_wait(look)   # binaryninjaui objects belong to the UI thread
+    except Exception as e:
+        box["error"] = e
+    if "error" in box:
+        log_warn("Script bridge: couldn't check the UI for %s being open (%r); opening anyway"
+                 % (path, box["error"]))
+    for name in box.get("names") or []:
+        if _same_file(name, abs_path):
+            return "%s is already open in Binary Ninja (a UI tab or MCP item)" % path
     return None
 
 
@@ -100,12 +133,13 @@ def _mcp_open_guard(path):
 def _bndb_open(path):
     """Open a headless cached view for a --bndb run (a .bndb opens its database; a raw binary
     is analysed once). Runs on an HTTP handler thread, like a --parallel script's own view.
-    Refuses (returns None) when the file is already open elsewhere, for the same
+    Refuses (raises, naming where) when the file is already open elsewhere, for the same
     one-handle-per-.bndb rule as the MCP proxy's open_guard."""
     busy = _open_elsewhere(path)
     if busy:
         log_warn("bnrun --bndb refused: " + busy)
-        return None
+        raise RuntimeError(busy + "; a second handle on it can deadlock Binary Ninja. Use "
+                           "that view (bnrun --view, with the lock) or close it first")
     bv = binaryninja.load(path)
     if bv is None:
         return None
