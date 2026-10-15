@@ -46,6 +46,7 @@ Open views and the active view are **shared across everything talking to that Bi
 ## Gotchas
 - BN can mis-type integer constants (ioctl codes, flags) as string-table pointers — they show as nonsense strings in calls; treat as ints, note it.
 - `set_comment_at` REPLACES a comment — read the existing one and carry it over.
+- Type names are keyed by `QualifiedName` *components*: a type defined as `QualifiedName(["Class", "VTable"])` is not found by `Type.named_type_reference(..., "Class::VTable")` (one component, same `str()`), and the only symptom is HLIL showing struct derefs as raw offsets. Build references with the same `QualifiedName([...])` you defined with (or look up `bv.types` keys to check). (bncpp, 2026-10-15)
 - Don't hand-decode a large `bv.read` blob — compute in-script (struct/int.from_bytes).
 - Unsaved work lives in RAM — `save_auto_snapshot()` (or `--bndb-save` for a cached view) before it's lost.
 - A cancel doesn't interrupt `binaryninja.load` of a big `.bndb` either (native call); it fires when the load returns.
