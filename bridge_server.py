@@ -110,6 +110,7 @@ leaks into whatever the thread (e.g. Binary Ninja's main thread) runs next.
 
 import ctypes
 import fnmatch
+import inspect
 import hmac
 import http.client
 import http.server
@@ -460,6 +461,7 @@ class Run:
         self.finished_at: Optional[float] = None
         self.opening_since: Optional[float] = None   # opening its --bndb (before the script)
         self.open_seconds = 0.0                      # spent opening; counts against timeout
+        self.open_progress: Optional[Tuple[int, int]] = None   # (current, total) of a .bndb load
 
     def state_name(self) -> str:
         if self.done.is_set():      # set after the reply and its on-disk record are written
@@ -482,6 +484,7 @@ class Run:
                   if self.started else 0,
                   "opening_for": int(now - self.opening_since)
                   if self.opening_since and not self.started else 0,
+                  "open_progress": list(self.open_progress) if self.open_progress else None,
                   "cancel_requested": self.cancel_by}
         if full:
             status["run_id"] = self.run_id
@@ -510,7 +513,9 @@ def describe_run(status: Optional[Dict[str, Any]]) -> str:
     if status.get("cancel_requested"):
         extra.append("cancel requested: %s" % status["cancel_requested"])
     if status.get("state") == "opening":
-        return "opening the bndb for script %r for %ds (%s)" % (
+        done, total = status.get("open_progress") or (0, 0)
+        return "opening the bndb%s for script %r for %ds (%s)" % (
+            " (%d%% loaded)" % (100 * done // total) if total else "",
             status["label"], status.get("opening_for", 0), ", ".join(extra))
     if status.get("state") == "queued":
         return "queued script %r for %ds (%s)" % (status["label"], status.get("queued_for", 0),
@@ -1282,10 +1287,19 @@ class ScriptBridge:
                     % (key, time.time() - self.bndb_hung[key]))
         box: Dict[str, Any] = {}
         done = threading.Event()
+        abort = threading.Event()
+
+        def progress(current: int, total: int) -> bool:
+            """For a hook that takes progress=: Binary Ninja calls it while loading a .bndb;
+            returning False aborts the load -- the one way to really stop an open."""
+            if run is not None:
+                run.open_progress = (int(current), int(total))
+            return not abort.is_set()
 
         def opener():
             try:
-                box["handle"] = self.bndb_open(key) if self.bndb_open else None
+                kwargs = {"progress": progress} if self._hook_takes("progress") else {}
+                box["handle"] = self.bndb_open(key, **kwargs) if self.bndb_open else None
             except Exception as e:  # noqa: BLE001 -- reported by the waiting run
                 box["error"] = e
             finally:
@@ -1293,7 +1307,7 @@ class ScriptBridge:
                     done.set()
                     if key in self.bndb_hung:       # its run gave up: keep what it opened
                         del self.bndb_hung[key]
-                        if box.get("handle") is not None:
+                        if box.get("handle") is not None:     # finished despite an abort
                             self.bndb_views[key] = box["handle"]
 
         started = time.time()
@@ -1310,16 +1324,18 @@ class ScriptBridge:
                     why = run.cancel_by = "timeout after %gs (opening the bndb)" % run.timeout
                 if why is None:
                     continue
+                abort.set()         # a .bndb load stops at its next progress step
                 with self.bndb_mutex:
                     if not done.is_set():
                         self.bndb_hung[key] = started
                         raise OpenAbandoned(
-                            "abandoned opening %s after %ds (%s); the open goes on inside "
-                            "Binary Ninja (a native call can't be interrupted) and its view is "
-                            "cached when it finishes; until then further --bndb runs of it are "
-                            "refused (--status: still opening). If it never finishes, it is "
-                            "stuck -- starved by another heavy load, or the file is open "
-                            "elsewhere too: restart Binary Ninja" % (key, time.time() - started, why))
+                            "abandoned opening %s after %ds (%s); a .bndb load is told to abort "
+                            "at its next progress step, any other open goes on inside Binary "
+                            "Ninja (a native call can't be interrupted) and its view is cached "
+                            "when it finishes. Until it ends, further --bndb runs of it are "
+                            "refused (--status: still opening). If it never ends, it is stuck "
+                            "-- starved by another heavy load, or the file is open elsewhere "
+                            "too: restart Binary Ninja" % (key, time.time() - started, why))
         finally:
             if run is not None:
                 run.open_seconds = time.time() - started
@@ -1337,6 +1353,14 @@ class ScriptBridge:
         if not self.bndb_save or not self.bndb_save(handle):
             raise RuntimeError("saving %s failed" % os.path.abspath(path))
         return os.path.abspath(path)     # the run's end refreshes bndb_dirty
+
+    def _hook_takes(self, name: str) -> bool:
+        """Whether the bndb_open hook accepts keyword `name` (older hooks take just the path)."""
+        try:
+            params = inspect.signature(self.bndb_open).parameters
+        except (TypeError, ValueError):
+            return False
+        return name in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
 
     def bndb_hung_status(self) -> List[Dict[str, Any]]:
         """Abandoned opens still stuck inside Binary Ninja, for GET /run."""

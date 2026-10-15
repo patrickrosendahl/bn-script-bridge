@@ -130,21 +130,23 @@ def _mcp_open_guard(path):
             "first (bnrun --bndb-close, or the file's tab/MCP item) -- without saving.")
 
 
-def _bndb_open(path):
-    """Open a headless cached view for a --bndb run (a .bndb opens its database; a raw binary
-    is analysed once). Runs on an HTTP handler thread, like a --parallel script's own view.
-    Refuses (raises, naming where) when the file is already open elsewhere, for the same
+def _bndb_open(path, progress=None):
+    """Open a headless cached view for a --bndb run (a .bndb opens its database without
+    updating the analysis; a raw binary is analysed once). Runs on a thread of the bridge,
+    like a --parallel script's own view. Refuses (raises, naming where) when the file is already open elsewhere, for the same
     one-handle-per-.bndb rule as the MCP proxy's open_guard."""
     busy = _open_elsewhere(path)
     if busy:
         log_warn("bnrun --bndb refused: " + busy)
         raise RuntimeError(busy + "; a second handle on it can deadlock Binary Ninja. Use "
                            "that view (bnrun --view, with the lock) or close it first")
-    bv = binaryninja.load(path)
-    if bv is None:
-        return None
-    bv.update_analysis_and_wait()      # near no-op for a .bndb; the raw-binary analysis wait
-    return bv
+    if path.lower().endswith(".bndb"):
+        # Never update the analysis when opening a database: what it saved is there at once,
+        # and a re-analysis of a big one (a kernelcache) can take 20+ minutes. Scripts that
+        # want fresh analysis call bv.update_analysis_and_wait() themselves. progress (from
+        # the bridge) reports the load and returns False to abort it (--timeout, --cancel).
+        return binaryninja.load(path, update_analysis=False, progress_func=progress)
+    return binaryninja.load(path)      # a raw binary: analysed once, load waits for it
 
 
 def _bndb_save(bv):

@@ -46,8 +46,9 @@ views (BinaryViewType[...].create(BinaryView.open(path)), binaryninja.load; clos
 bv.file.close()) don't need the lock and run even while another session holds it (unless
 it is exclusive).
 
---bndb PATH opens that file headlessly (a .bndb opens its database and carries renames; a raw
-binary is analysed once), caches the view and hands it to the script as `bv` -- no usage lock
+--bndb PATH opens that file headlessly (a .bndb opens its database and carries renames, without
+updating its analysis -- call bv.update_analysis_and_wait() if a script needs it; a raw binary
+is analysed once), caches the view and hands it to the script as `bv` -- no usage lock
 needed. Cached views are shared, so --bndb runs go through the serialized lane and can't be
 combined with --view, --main-thread or --parallel. `bvs` stays unavailable (the UI views need
 the lock); the cache outlives the script: --bndb-list shows it, --bndb-save writes renames etc.

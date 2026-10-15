@@ -1373,6 +1373,40 @@ class BndbOpenHangTest(BridgeFixture):
         self.assertEqual(box["reply"][1]["cancelled_by"], "session s")
         self.assertIsNone(self.request("GET", "/run")[1]["running"])
 
+    def test_progress_reported_and_abort_stops_a_bndb_load(self):
+        steps = []
+
+        def loading(path, progress):
+            for i in range(1000):                 # a slow .bndb load that reports progress
+                steps.append(i)
+                if not progress(i, 1000):
+                    raise RuntimeError("load aborted")
+                time.sleep(0.01)
+            return CachedView(path)
+        self.bridge.bndb_open = loading
+        path = self.path("big.bndb")
+        t, box = self.run_async({"code": "result = 1", "bndb": path, "timeout": 0.6})
+        for _ in range(100):
+            running = self.request("GET", "/run")[1]["running"]
+            if running and running.get("open_progress"):
+                break
+            time.sleep(0.01)
+        self.assertRegex(bridge_server.describe_run(running),
+                         r"opening the bndb \(\d+% loaded\) for script")
+        t.join(5)
+        self.assertEqual(box["reply"][1]["cancelled_by"], "timeout after 0.6s (opening the bndb)")
+        for _ in range(100):                      # the load saw False and ended
+            if not self.bridge.bndb_hung:
+                break
+            time.sleep(0.01)
+        self.assertEqual(self.bridge.bndb_hung, {})
+        self.assertEqual(self.bridge.bndb_views, {})    # aborted: nothing cached
+        self.assertLess(len(steps), 1000)
+
+    def test_hooks_without_progress_still_work(self):
+        self.assertFalse(self.bridge._hook_takes("progress"))     # stuck_open(path)
+        self.assertEqual(self.run_bndb(self.path("plain.bndb"))[1]["ok"], True)
+
     def test_script_timeout_gets_what_the_open_left(self):
         def slow_open(path):
             time.sleep(0.6)

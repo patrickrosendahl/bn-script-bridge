@@ -179,8 +179,13 @@ changes a forwarded key while the script runs (it doesn't), that change is overw
 
 One-shot scripts that call `binaryninja.load()` on the raw binary pay the full analysis every
 time (minutes on big binaries). `--bndb` instead opens the file headlessly once, caches the
-view and hands it to each script as `bv` — a `.bndb` opens instantly and carries renames; a raw
-binary is analysed once (the first run) and `--bndb-save` materializes `<file>.bndb` beside it.
+view and hands it to each script as `bv` — a `.bndb` opens its database and carries renames
+**without updating its analysis** (re-analysing a big one, such as a kernelcache, took 20+
+minutes; what the database saved -- functions, names, types, comments -- is there at once, and a
+function's IL is still computed when a script asks for it); a script that needs fresh analysis
+calls `bv.update_analysis_and_wait()` itself. A raw binary is analysed once (the first run) and
+`--bndb-save` materializes `<file>.bndb` beside it. While a `.bndb` loads, `--status` shows how
+far (`opening the bndb (37% loaded) ...`), and `--timeout`/`--cancel` really abort the load.
 
 ```sh
 bnrun --bndb synthv-studio.x86_64.bndb -e 'result = len(list(bv.functions))'
