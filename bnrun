@@ -334,7 +334,9 @@ def render(status, reply, args) -> int:
         print("bnrun: %s" % reply.get("error"), file=sys.stderr)
         return 1
     if status == 423:
-        print("bnrun: Binary Ninja is %s" % describe(reply["lock"]), file=sys.stderr)
+        # the bridge's own text: it says whether --bndb/--parallel runs may still go ahead
+        print("bnrun: %s" % (reply.get("error") or "Binary Ninja is " + describe(reply["lock"])),
+              file=sys.stderr)
         return 3
     if status in (400, 409):
         print("bnrun: refused: %s" % reply.get("error"), file=sys.stderr)
@@ -469,7 +471,9 @@ def bndb_command(args) -> int:
                                    "session": args.session}, timeout,
                          passthrough=(404, 409, 423))
     if status == 423:
-        print("bnrun: Binary Ninja is %s" % describe(reply["lock"]), file=sys.stderr)
+        # the bridge's own text: it says whether --bndb/--parallel runs may still go ahead
+        print("bnrun: %s" % (reply.get("error") or "Binary Ninja is " + describe(reply["lock"])),
+              file=sys.stderr)
         return 3
     if status in (400, 404, 409):
         print("bnrun: %s" % reply.get("error"), file=sys.stderr)
