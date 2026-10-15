@@ -1167,7 +1167,7 @@ class JobsTest(BridgeFixture):
     def test_lost_jobs_reported_requeued_and_forgotten(self):
         self.submit("gate.wait()", "was-running", session="s", name="synthv")
         self.wait_state("was-running", "running")
-        self.submit("hits.append('again')", "was-queued", session="s", name="synthv",
+        self.submit("hits.append(argv[1])", "was-queued", session="s", name="synthv",
                     args=["<bnrun>", "R:1:x"])
         self.wait_state("was-queued", "queued")
         self.crash_and_restart()
@@ -1185,7 +1185,7 @@ class JobsTest(BridgeFixture):
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("was-running: was running when its bridge died", r.stderr)
         self.assertIn("requeued was-queued as", r.stderr)
-        self.assertEqual(self.hits, ["again"])
+        self.assertEqual(self.hits, ["R:1:x"])            # rerun with its own argv
         self.assertEqual(list(self.bridge.lost), ["was-running"])
         self.assertEqual(self.bnrun("--forget", "was-running").stdout, "forgot was-running\n")
         self.assertEqual(self.bridge.lost, {})
@@ -1447,6 +1447,362 @@ class BnrestartBusyTest(unittest.TestCase):
         self.assertEqual(self.mod.busy_reasons(dict(idle, parallel=[{}], parallel_queued=1)),
                          ["1 script(s) running", "1 queued"])
         self.assertEqual(self.mod.busy_reasons({}), [])       # older bridge: missing keys
+
+
+class _FakeFile:
+    def __init__(self, filename, original=None, modified=False, has_database=True):
+        self.filename, self.original_filename = filename, original or filename
+        self.modified, self.has_database = modified, has_database
+        self.snapshots = 0
+        self.closed = False
+
+    def save_auto_snapshot(self):
+        self.snapshots += 1
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeView:
+    def __init__(self, filename, **kw):
+        self.file = _FakeFile(filename, **kw)
+        self.created = []
+
+    def create_database(self, path):
+        self.created.append(path)
+        return True
+
+
+class PluginGlueTest(unittest.TestCase):
+    """__init__.py (the Binary Ninja plugin) against fake binaryninja / binaryninjaui modules:
+    the --bndb open/save/close hooks, the double-open guard and start/stop wiring."""
+
+    def setUp(self):
+        import importlib.util
+        import types
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.loads, self.logs, self.main_calls = [], [], []
+        test = self
+
+        bn = types.ModuleType("binaryninja")
+        bn.user_directory = lambda: self.tmp.name
+
+        def load(path, **kwargs):
+            test.loads.append((path, kwargs))
+            progress = kwargs.get("progress_func")
+            if progress is not None and not progress(1, 4):
+                raise RuntimeError("load aborted")
+            return test.next_view or _FakeView(path)
+        bn.load = load
+        bn.log_info = lambda m: self.logs.append(("info", m))
+        bn.log_warn = lambda m: self.logs.append(("warn", m))
+
+        class Settings:
+            def register_group(self, *a): pass
+            def register_setting(self, *a): return True
+            def get_bool(self, k): return False
+            def get_integer(self, k): return 4 if k == "scriptbridge.maxParallel" else 0
+            def get_string(self, k): return ""
+        bn.Settings = Settings
+        bn.PluginCommand = type("PluginCommand", (), {"register": staticmethod(lambda *a: None)})
+        mainthread = types.ModuleType("binaryninja.mainthread")
+
+        def on_main(fn):
+            test.main_calls.append(fn)
+            fn()
+        mainthread.execute_on_main_thread = on_main
+        mainthread.execute_on_main_thread_and_wait = on_main
+        bn.mainthread = mainthread
+        self.next_view = None
+        self.ui_files = []          # FileContext filenames the fake UI holds
+        self.ui_views = []          # views in the fake UI's tabs
+        self.ui_broken = False
+
+        ui = types.ModuleType("binaryninjaui")
+
+        class FileContext:
+            def __init__(self, name):
+                self.name = name
+
+            def getFilename(self):
+                return self.name
+
+            @staticmethod
+            def getOpenFileContexts():
+                if test.ui_broken:
+                    raise RuntimeError("no UI")
+                return [FileContext(n) for n in test.ui_files]
+
+        class Frame:
+            def __init__(self, bv):
+                self.bv = bv
+
+            def getCurrentBinaryView(self):
+                return self.bv
+
+        class Ctx:
+            def getTabs(self):
+                return list(range(len(test.ui_views)))
+
+            def getViewFrameForTab(self, tab):
+                return Frame(test.ui_views[tab])
+
+            def getCurrentViewFrame(self):
+                return None
+
+        class UIContext:
+            allContexts = staticmethod(lambda: [Ctx()])
+            activeContext = staticmethod(lambda: None)
+        ui.FileContext, ui.UIContext = FileContext, UIContext
+        # no Menu/UIAction: _register_menu's ImportError branch runs (headless)
+        saved = {k: sys.modules.get(k) for k in ("binaryninja", "binaryninja.mainthread",
+                                                 "binaryninjaui")}
+        sys.modules.update({"binaryninja": bn, "binaryninja.mainthread": mainthread})
+        sys.modules.pop("binaryninjaui", None)
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+            for k in [k for k in sys.modules if k.startswith("bnsb_plugin")]:
+                del sys.modules[k]
+        self.addCleanup(restore)
+        spec = importlib.util.spec_from_file_location(
+            "bnsb_plugin", os.path.join(ROOT, "__init__.py"), submodule_search_locations=[ROOT])
+        self.plugin = importlib.util.module_from_spec(spec)
+        sys.modules["bnsb_plugin"] = self.plugin
+        spec.loader.exec_module(self.plugin)
+        sys.modules["binaryninjaui"] = ui      # from now on the UI "is up"
+
+        class NoProxy:      # the MCP proxy needs Binary Ninja's own MCP server
+            def __init__(self, *a, **kw):
+                raise OSError("no MCP in tests")
+        self.plugin.bridge_server.McpProxy = NoProxy
+        self.addCleanup(self.plugin.stop)
+
+    def file(self, name):
+        path = os.path.join(os.path.realpath(self.tmp.name), name)
+        with open(path, "w") as f:
+            f.write("x")
+        return path
+
+    def test_bndb_opens_without_analysis_and_passes_progress(self):
+        db = self.file("big.bndb")
+        progress = lambda done, total: True
+        bv = self.plugin._bndb_open(db, progress=progress)
+        self.assertEqual(self.loads, [(db, {"update_analysis": False, "progress_func": progress})])
+        self.assertEqual(bv.file.filename, db)
+
+    def test_raw_binary_is_analysed(self):
+        raw = self.file("kext")
+        self.plugin._bndb_open(raw)
+        self.assertEqual(self.loads, [(raw, {})])       # load's default: update_analysis=True
+
+    def test_refuses_a_file_open_in_a_ui_file_context(self):
+        db = self.file("open.bndb")
+        self.ui_files = [db]
+        with self.assertRaises(RuntimeError) as cm:
+            self.plugin._bndb_open(db)
+        self.assertIn("already open in Binary Ninja", str(cm.exception))
+        self.assertEqual(self.loads, [])
+        self.assertTrue(self.main_calls)                # the UI was asked on the main thread
+
+    def test_refuses_a_file_open_as_a_tabs_original_binary(self):
+        raw = self.file("kernelcache")
+        self.ui_views = [_FakeView("/elsewhere/kernelcache.bndb", original=raw)]
+        with self.assertRaises(RuntimeError):
+            self.plugin._bndb_open(raw)
+        link = os.path.join(self.tmp.name, "link")      # samefile, not string compare
+        os.symlink(raw, link)
+        with self.assertRaises(RuntimeError):
+            self.plugin._bndb_open(link)
+
+    def test_ui_check_failure_warns_and_opens(self):
+        self.ui_broken = True
+        db = self.file("x.bndb")
+        self.plugin._bndb_open(db)
+        self.assertEqual(len(self.loads), 1)
+        self.assertTrue(any(level == "warn" and "couldn't check the UI" in m
+                            for level, m in self.logs))
+
+    def test_mcp_guard_and_cached_view_refusal(self):
+        db = self.file("c.bndb")
+        self.assertIsNone(self.plugin._mcp_open_guard(db))
+        self.plugin.start()
+        self.plugin._bridge.bndb_views[db] = object()
+        refusal = self.plugin._mcp_open_guard(db)
+        self.assertIn("cached view", refusal)
+        self.assertIn("opening it twice would deadlock", refusal)
+
+    def test_save_and_close_hooks(self):
+        v = _FakeView("/x/a.bndb")
+        self.assertTrue(self.plugin._bndb_save(v))
+        self.assertEqual(v.file.snapshots, 1)
+        raw = _FakeView("/x/kext", has_database=False)
+        self.plugin._bndb_save(raw)
+        self.assertEqual(raw.created, ["/x/kext.bndb"])
+        self.plugin._bndb_close(v)
+        self.assertTrue(v.file.closed)
+
+    def test_start_wires_spool_modified_flag_and_progress_end_to_end(self):
+        self.plugin.start()
+        self.assertTrue(any("MCP proxy not started" in m for _, m in self.logs))
+        bridge = self.plugin._bridge
+        config = os.path.join(self.tmp.name, "script_bridge.json")
+        self.assertEqual(oct(os.stat(config).st_mode & 0o777), "0o600")
+        self.assertEqual(bridge.spool_dir, os.path.join(self.tmp.name, "script_bridge_spool"))
+        db = self.file("e2e.bndb")
+        self.next_view = _FakeView(db, modified=True)
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=config)
+        r = subprocess.run([sys.executable, BNRUN, "--bndb", db, "-e", "result = bv.file.filename"],
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, db), r.stderr)
+        self.assertEqual(self.loads[0][1]["update_analysis"], False)
+        self.assertIn("progress_func", self.loads[0][1])            # the bridge's callback
+        self.assertEqual(bridge.bndb_status()[0]["modified"], True)  # bv.file.modified
+        self.plugin.stop()
+        self.assertFalse(os.path.exists(config))
+        self.assertIsNone(self.plugin._bridge)
+
+
+class LegacyBridgeClientTest(unittest.TestCase):
+    """bnrun against a bridge from before the job protocol (no "jobs" in /ping)."""
+
+    def setUp(self):
+        token = "t" * 20
+        self.runs = []
+        test = self
+
+        class Old(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, body):
+                data = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self._send({"ok": True})
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                test.runs.append(req)
+                self._send({"ok": True, "stdout": "old bridge\n", "result": None, "error": None})
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Old)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.shutdown)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = os.path.join(self.tmp.name, "c.json")
+        with open(self.config, "w") as f:
+            json.dump({"port": self.httpd.server_address[1], "token": token}, f)
+
+    def bnrun(self, *args):
+        env = dict(os.environ, BN_SCRIPT_BRIDGE_CONFIG=self.config)
+        return subprocess.run([sys.executable, BNRUN, *args], capture_output=True, text=True,
+                              env=env, timeout=30)
+
+    def test_falls_back_to_one_held_open_request(self):
+        r = self.bnrun("-e", "pass")
+        self.assertEqual((r.returncode, r.stdout), (0, "old bridge\n"), r.stderr)
+        self.assertNotIn("async", self.runs[0])
+
+    def test_detach_refused(self):
+        r = self.bnrun("--detach", "-e", "pass")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("can't --detach", r.stderr)
+        self.assertEqual(self.runs, [])
+
+
+class SpoolRobustnessTest(BridgeFixture):
+    """Corrupt or unwritable spool files never stop the bridge or a job."""
+
+    def test_corrupt_records_are_skipped(self):
+        spool = os.path.join(self.tmp.name, "spool")
+        for sub in ("", "lost", "done"):
+            os.makedirs(os.path.join(spool, sub), exist_ok=True)
+            with open(os.path.join(spool, sub, "bad.json"), "w") as f:
+                f.write("{not json")
+        with open(os.path.join(spool, "lost", "notes.txt"), "w") as f:
+            f.write("ignore me")
+        bridge = bridge_server.ScriptBridge(self.token, namespace, spool_dir=spool)
+        self.assertEqual((bridge.lost, bridge.done_records), ({}, {}))
+
+    def test_unwritable_spool_still_runs_jobs(self):
+        spool = os.path.join(self.tmp.name, "ro")
+        os.makedirs(spool)
+        bridge = bridge_server.ScriptBridge(self.token, namespace, spool_dir=spool)
+        os.chmod(spool, 0o500)
+        try:
+            reply = bridge.execute("result = 6 * 7", None, False)
+        finally:
+            os.chmod(spool, 0o700)
+        self.assertEqual(reply["result"], 42)
+
+
+class JobBookkeepingTest(BridgeFixture):
+    """Retention, /result arguments and /jobs privacy."""
+
+    def test_finished_jobs_pruned_beyond_job_keep(self):
+        keep = bridge_server.JOB_KEEP
+        bridge_server.JOB_KEEP = 3
+        self.addCleanup(setattr, bridge_server, "JOB_KEEP", keep)
+        for i in range(6):
+            self.bridge.execute("pass", None, False, run_id="j%d" % i)
+        self.bridge.execute("pass", None, False, run_id="last")
+        self.assertLessEqual(len(self.bridge.jobs), 4)
+        self.assertIn("last", self.bridge.jobs)
+        self.assertNotIn("j0", self.bridge.jobs)
+
+    def test_result_arguments(self):
+        self.assertEqual(self.request("POST", "/result", {"run_id": 5})[0], 400)
+        self.assertEqual(self.request("POST", "/result", {"run_id": "x", "wait": "soon"})[0], 400)
+        self.request("POST", "/run", {"code": "pass", "run_id": "quick"})
+        t0 = time.time()
+        status, reply = self.request("POST", "/result", {"run_id": "quick", "wait": 10 ** 6})
+        self.assertEqual((status, reply["state"]), (200, "done"))
+        self.assertLess(time.time() - t0, 5)            # done already: no wait at all
+
+    def test_jobs_lists_only_the_callers_jobs(self):
+        self.request("POST", "/run", {"code": "pass", "run_id": "mine", "session": "a"})
+        self.request("POST", "/run", {"code": "pass", "run_id": "theirs", "session": "b"})
+        jobs = self.request("POST", "/jobs", {"session": "a"})[1]["jobs"]
+        self.assertEqual([j["run_id"] for j in jobs], ["mine"])
+
+    def test_cancel_by_run_id_hits_a_running_job(self):
+        status, _ = self.request("POST", "/run", {"code": BUSY, "run_id": "spin", "async": True})
+        self.assertEqual(status, 202)
+        for _ in range(500):
+            if (self.request("POST", "/result", {"run_id": "spin"})[1]["state"]) == "running":
+                break
+            time.sleep(0.01)
+        r = self.bnrun("--cancel", "spin")
+        self.assertIn("cancel sent", r.stdout)
+        reply = self.request("POST", "/result", {"run_id": "spin", "wait": 5})[1]
+        self.assertEqual((reply["state"], reply["reply"]["cancelled_by"]), ("done", "its client"))
+
+
+class HeadlessLockTest(unittest.TestCase):
+    def test_headless_use_never_renews_and_exclusive_blocks_it(self):
+        clock = FakeClock()
+        lock = bridge_server.UsageLock(clock)
+        lock.acquire("holder", ttl=60)
+        clock.now += 50
+        self.assertEqual(lock.check_use("other", headless=True)[0], True)
+        self.assertEqual(lock.status()["expires_in"], 10)          # not renewed by others
+        self.assertEqual(lock.check_use("other")[0], False)
+        lock.acquire("holder", ttl=60, exclusive=True)
+        self.assertEqual(lock.check_use("other", headless=True)[0], False)
+        self.assertEqual(lock.check_use("holder", headless=True)[0], True)
+        clock.now += 61
+        self.assertEqual(lock.check_use("other")[0], True)         # expired: free
 
 
 class RunScriptExitTest(unittest.TestCase):

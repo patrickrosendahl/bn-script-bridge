@@ -492,7 +492,11 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 including a fake main-thread runner, the parallel lane and its slot limit, the UI-view rules,
 args/env forwarding, async jobs, the spool and lost-job requeue, the `--bndb` cache with fake hooks, the MCP proxy against a fake upstream
 including the tool allowlist), `bnrun` (including Ctrl-C/SIGTERM and `--max-out`), the
-bundled scripts and `bnannotate` against a fake BinaryView, and `mcp-session-header`, with a fake namespace and a fake home directory. The plugin glue
-(`__init__.py`: UI view lookup, settings, menu commands, moving and restarting Binary Ninja's
-MCP server, the real `--bndb` open/save/close) only runs inside Binary Ninja and is not
-covered.
+bundled scripts and `bnannotate` against a fake BinaryView, `bnrestart`'s idle check,
+`bnrun` against a pre-job-protocol bridge, the spool (lost/done records, corrupt or unwritable
+files) and `mcp-session-header`, with a fake namespace and a fake home directory. The plugin
+glue (`__init__.py`) is loaded against fake `binaryninja`/`binaryninjaui` modules: the `--bndb`
+open (no analysis for a `.bndb`, the progress callback, raw binaries analysed), the double-open
+guard (UI file contexts, tabs' original binaries, cached views, a failing UI check), save/close
+and start/stop end to end through `bnrun`. Not covered: the real Binary Ninja API behind those
+fakes, the UI menu, and moving/restarting Binary Ninja's MCP server.
