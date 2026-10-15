@@ -1058,6 +1058,16 @@ class BndbCacheTest(BridgeFixture):
         self.assertTrue(reply["ok"])
         self.assertEqual(len(self.opened), 2)
 
+    def test_bnrun_bndb_save_with_bndb_targets_only_that_view(self):
+        mine, theirs = self.path("mine.bndb"), self.path("theirs.bndb")
+        self.run_bndb(mine)
+        self.run_bndb(theirs)
+        r = self.bnrun("--bndb", mine, "--bndb-save")
+        self.assertEqual((r.returncode, r.stdout), (0, "saved %s\n" % os.path.abspath(mine)))
+        r = self.bnrun("--bndb", mine, "--bndb-close")
+        self.assertEqual(r.stdout, "closed %s\n" % os.path.abspath(mine))
+        self.assertEqual(self.bridge.bndb_paths(None), [os.path.abspath(theirs)])
+
     def test_bnrun_bndb_flags(self):
         path = self.path()
         r = self.bnrun("--bndb", path, "-e", "result = bv.path")

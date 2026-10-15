@@ -191,9 +191,13 @@ far (`opening the bndb (37% loaded) ...`), and `--timeout`/`--cancel` really abo
 bnrun --bndb synthv-studio.x86_64.bndb -e 'result = len(list(bv.functions))'
 bnrun --bndb synthv-studio.x86_64.bndb script.py -- extra-arg
 bnrun --bndb-list                                 # what's cached (also in --status), "(unsaved changes)" marks edits not yet saved
-bnrun --bndb-save                                 # write renames etc. back into the .bndb
-bnrun --bndb-close                                # free the memory (tens of MB per view)
+bnrun --bndb $DB --bndb-save                      # write renames etc. back into that .bndb
+bnrun --bndb $DB --bndb-close                     # free its memory (tens of MB per view)
+bnrun --bndb-save                                 # no PATH and no --bndb: ALL cached views
 ```
+
+`--bndb-save`/`--bndb-close` act on their PATH, else on the `--bndb` PATH, else on every
+cached view -- other sessions' too (a bare `--bndb-close` throws away their unsaved edits).
 
 `bnrun` sends the `--bndb` path (and a `--bndb-save`/`--bndb-close` PATH) as an absolute
 path, so relative paths mean the current directory, not Binary Ninja's.

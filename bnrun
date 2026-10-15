@@ -174,9 +174,9 @@ def main() -> int:
                       "or with --force); with RUN_ID just that job, also while queued")
     lock.add_argument("--bndb-list", action="store_true", help="list the cached headless views")
     lock.add_argument("--bndb-save", nargs="?", const="", metavar="PATH", help="save cached "
-                      "view(s) into their .bndb (all when PATH is omitted)")
+                      "view(s) into their .bndb (PATH, else the --bndb one, else all)")
     lock.add_argument("--bndb-close", nargs="?", const="", metavar="PATH", help="close and drop "
-                      "cached view(s) (all when PATH is omitted)")
+                      "cached view(s) (PATH, else the --bndb one, else all)")
     lock.add_argument("--wait", metavar="RUN_ID", help="wait for that job and print its output")
     lock.add_argument("--jobs", action="store_true", help="this session's jobs and the lost ones")
     lock.add_argument("--requeue", nargs="+", metavar="RUN_ID", help="rerun lost jobs (or all) "
@@ -466,6 +466,8 @@ def bndb_command(args) -> int:
         return 0
     action = "save" if args.bndb_save is not None else "close"
     path = args.bndb_save if action == "save" else args.bndb_close
+    if not path and args.bndb:
+        path = args.bndb      # `--bndb A --bndb-save` means A, not every cached view
     timeout = 300 if action == "save" else 30    # a save can write a whole .bndb
     status, reply = call("/bndb", {"action": action,
                                    "path": os.path.abspath(path) if path else None,

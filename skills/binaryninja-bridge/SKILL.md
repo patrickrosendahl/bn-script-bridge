@@ -31,7 +31,7 @@ These need the plugin from 2026-10-14 or later (loaded at a BN restart); against
 ## `--bndb` fast path (no lock, no re-analysis)
 ```sh
 $BNRUN --bndb /path/target.bndb -e 'result = len(list(bv.functions))'
-$BNRUN --bndb-save            # write renames etc. into the .bndb (or save_bndb() inside the editing job -- preferred)
+$BNRUN --bndb $DB --bndb-save   # write renames etc. into that .bndb (bare --bndb-save saves ALL cached views, others' too; save_bndb() in the editing job is preferred)
 $BNRUN --bndb-list            # cached views (also in --status), "(unsaved changes)" = edits a crash would lose; --bndb-close frees them
 ```
 Opens the file headlessly once, caches it and hands it to every later run as `bv`. A `.bndb` opens **without updating its analysis** (saved functions/names/types are there; IL is computed per function on demand) -- call `bv.update_analysis_and_wait()` in the script only if you need fresh analysis (it can take 20+ min on a kernelcache). Otherwise instant after the first open (big `.bndb` ~1 min, not a hang), no need to take the lock, carries renames. Prefer it over `binaryninja.load()` per script. Serialized; not with `--view`/`--main-thread`/`--parallel`; `bvs` unavailable. Scripts get `save_bndb()`: save in the same job as the edits, so a dead client can't leave them unsaved.
